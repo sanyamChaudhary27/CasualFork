@@ -50,6 +50,8 @@ No agent should spend significant time on auth, accounts, payments, deployment p
 
 Before a paid GPU run, require a written hypothesis, exact command/notebook cell, expected output, stop condition, and fallback. Debug package imports, data plumbing, prompts, and CPU-testable logic without paid accelerators whenever possible.
 
+Paid runs additionally require a completed GPU experiment proposal (COMPANY.md "GPU experiment proposal gate") with reviewer countersignature before launch.
+
 ### One writer per file
 
 Parallel research is encouraged. Parallel edits to the same file are forbidden.
@@ -78,6 +80,12 @@ For backend choice, novelty claim, reward design, or compute spend:
 2. commission a skeptic / red-team;
 3. compare evidence;
 4. orchestrator records the decision in `DECISIONS.md`.
+
+### Context independence (sealed review)
+
+For material research decisions, independent reviewers must form and record their preliminary judgment BEFORE receiving any other panel member's conclusion. Independence means fresh-context plus conclusion-blind; role naming alone does not establish independence.
+
+The orchestrator must record the seal order — who was dispatched, in what order, when each report returned and was sealed — so retrospective fake consensus is detectable. Reports are revealed simultaneously only after every usable independent report is sealed (see COMPANY.md "Sealed review protocol").
 
 ### Search before RL
 
@@ -119,6 +127,8 @@ Every serious experiment must record at minimum:
 - pass/fail against a predeclared gate.
 
 A visually good clip without this record is a demo candidate, not research evidence.
+
+Gate status vocabulary: without independent reviewer verification of the evidence, a gate is UNVERIFIED, never PASS. The experiment owner cannot approve its own gate; the orchestrator adjudicates only after reviewer verification.
 
 ## Claim hygiene
 

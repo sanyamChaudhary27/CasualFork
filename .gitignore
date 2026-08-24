@@ -1,0 +1,9 @@
+# Heavy/vendored dependencies - never commit
+.opencode/node_modules/
+__pycache__/
+*.pyc
+
+# Generated experiment outputs (constitution: artifacts live outside Git)
+artifacts/
+runs/
+outputs/

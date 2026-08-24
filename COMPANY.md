@@ -79,6 +79,21 @@ A bad delegation is:
 Research EVOKE and build the project.
 ```
 
+## Child result statuses
+
+The orchestrator classifies every child return into exactly one status:
+
+| Status | Meaning |
+|---|---|
+| SUCCESS | Completed with usable evidence |
+| RESEARCH_NEGATIVE | Completed; the genuine answer is negative or empty — this is a real result |
+| INFRA_FAILURE | Provider/network/runtime failure; carries zero evidential weight |
+| PERMISSION_FAILURE | Blocked by permissions/config; retry after wiring is fixed |
+| TIMEOUT | Exceeded bounds; may be retried with reduced scope |
+| INVALID_EVIDENCE | Content returned but fails citation/evidence standards |
+
+Infrastructure or provider failure must never be interpreted as research evidence. A failed red-team is not a passed red-team.
+
 ## Fan-out / fan-in pattern
 
 For a major decision the orchestrator should:
@@ -89,6 +104,16 @@ For a major decision the orchestrator should:
 4. Identify disagreements, not just majority opinion.
 5. If disagreement is material, dispatch a reviewer with both positions.
 6. Record the decision and evidence in `DECISIONS.md`.
+
+## Sealed review protocol
+
+For material decisions (novelty, backend choice, reward design, thesis changes), reviews run through the sealed pipeline. Use `FANIN_TEMPLATE.md` as the canonical record format.
+
+- **STAGE 1 — Independent dispatch.** All panelists receive the same research question, evidence requirements, project constraints, and primary-source requirement. They do NOT receive one another's findings.
+- **STAGE 2 — Sealed returns.** For each panelist record: session ID, role, dispatch time/order, return status (see Child result statuses), evidence tier, primary sources inspected, verdict, confidence, unresolved questions.
+- **STAGE 3 — Reveal.** Only after all usable independent reports are sealed may reports be exposed to a synthesis agent.
+- **STAGE 4 — Adversarial synthesis.** Synthesis must preserve disagreements rather than average them.
+- **STAGE 5 — Adjudication.** A separate adjudicator checks the synthesis against primary sources before any root research claim is changed.
 
 ## Write ownership
 
@@ -103,6 +128,33 @@ Default ownership:
 | Reviews | nobody; reviewers report only |
 
 If parallel writing is required, isolate with Git worktrees.
+
+## Gate adjudication
+
+Gates follow: experiment owner proposes → reviewer independently verifies evidence → orchestrator adjudicates.
+
+Without independent reviewer approval, a gate is **UNVERIFIED** — never PASS. The orchestrator may not countersign its own experiments.
+
+## GPU experiment proposal gate
+
+No paid-GPU run starts without a completed proposal. Integrated with the `experiment-reproduction` skill: the proposal is the front matter of the same manifest that skill already requires — do not maintain two formats.
+
+Required fields:
+
+- Research question
+- Hypothesis
+- Decision affected
+- Cheapest falsification
+- CPU alternative
+- Colab alternative
+- Requested GPU/VRAM
+- Expected paid-GPU consumption
+- Success criterion
+- Failure criterion
+- Artifacts to preserve
+- Reviewer countersignature
+
+If the CPU or Colab alternative can answer the question, the paid run is rejected.
 
 ## Thread/session management
 
