@@ -26,18 +26,39 @@ Use when we need a longer-lived GPU machine, larger VRAM, or service-style integ
 
 | Gate | Question | Required evidence | Fail action |
 |---|---|---|---|
+| GF0 | STRICT FORK FEASIBILITY — before any paid inference: can the chosen backend expose, snapshot, clone, replay, or otherwise control all state required for meaningful future-noise coupling at the branch point? | code-level trace of RNG creation/use; scheduler/generator behavior; state-bank mutation behavior; branch-state clone strategy; identified tensor/state boundary; proof or falsification of deterministic continuation assumptions. CPU/static-analysis FIRST. **GF0 cannot PASS from documentation alone.** | downgrade to prefix-shared/seed-matched per SPEC §2a fallback rule |
 | G0 | Is the environment known? | hardware/software report saved | fix environment only |
 | G1 | Does official upstream inference run? | unmodified official sample + artifact | stop custom code |
 | G2 | Does our input run? | custom source image produces output | change input/profile/backend |
 | G3 | Does camera control visibly work? | fixed camera path + expected motion | inspect control encoding |
 | G4 | Can we create an identical stored prefix? | prefix hashes/bytes or documented state clone | downgrade claim or change backend |
-| G5 | Can one intervention visibly change the future? | synchronized factual/counterfactual clips | adjust backend/prompt schedule |
+| G5 | Can one intervention visibly change the future? | synchronized factual/counterfactual clips (SC1 ablation branches per SPEC §2b) | adjust backend/prompt schedule |
 | G6 | Is unrelated structure preserved enough? | metrics + human review above threshold | search/reward/backend work |
-| G7 | Does search beat a fixed recipe? | held-out best-of-N/CEM comparison | do not add RL |
-| G8 | Does a learned controller beat search baseline? | held-out evaluation | keep search-only contribution |
+| G7 | Does search beat a fixed recipe? **CONDITIONAL on SC1 success** | held-out best-of-N/CEM comparison | do not add RL |
+| G8 | Does a learned controller beat search baseline? **CONDITIONAL on SC1+G7 success** | held-out evaluation | keep search-only contribution |
 | G9 | Is the hero demo reproducible? | one-command/notebook rerun + artifact manifest | no launch yet |
 
-Frontend work may begin after **G6**. RL work may begin after **G7**.
+**No paid inference may start before GF0 is adjudicated.** Frontend work may begin after **G6**. Search/RL gates (G7/G8) are POST-SC1 stretch work per the 2026-08-24 adjudication and SPEC §7.
+
+## GF0 — strict fork feasibility (CPU/static first)
+
+Question: can the chosen backend expose, snapshot, clone, replay, or otherwise control all state required for meaningful future-noise coupling at the branch point?
+
+Required evidence (all code-level, pinned commit):
+
+- RNG call graph: where `torch.Generator` objects are created, `manual_seed` calls, `randn`/`randn_tensor` calls, device-specific RNG state;
+- scheduler/generator stochasticity behavior per generation chunk;
+- world-state-bank mutation points and eviction behavior;
+- branch-state clone strategy (deepcopy sufficiency; tensor aliasing);
+- identified tensor/state boundary that must be serialized at fork time;
+- proof or falsification of deterministic continuation assumptions.
+
+Rules:
+
+1. CPU/static analysis first; no model-weight download unless a tiny config/tokenizer file is essential.
+2. **GF0 cannot PASS from documentation alone** — documentation claims must be confirmed against actual code paths.
+3. A mock/model-free fork harness (backend-agnostic) must demonstrate our infrastructure can hold future noise equal across restored branches before any backend claim.
+4. Verdict vocabulary: GF0_STRICT_FEASIBLE | GF0_FEASIBLE_WITH_PATCH | GF0_SEED_MATCHED_ONLY | GF0_INFEASIBLE.
 
 ## G0 — runtime audit
 

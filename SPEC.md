@@ -39,6 +39,28 @@ Desired coupling:
 
 When exact noise/state coupling is impossible, the system must label the comparison as **prefix-shared / seed-matched** rather than strict counterfactual coupling.
 
+### 2a. Coupling vocabulary — EXACT TERMS, never conflate
+
+| Term | Meaning | Claim strength |
+|---|---|---|
+| **strict-coupled** | Shared prefix AND future exogenous noise ε_F[t*:T] == ε_C[t*:T] held equal by construction (captured/reused RNG state or explicit noise tensors). | Supports SC1/SC2 language. |
+| **prefix-shared / seed-matched** | Identical stored prefix and identical run-level seed, but future stochastic innovations are NOT provably equal across branches. | Never call this strict-coupled; never use it for causal wording. |
+| **uncontrolled** | Independent runs; no prefix, seed, or noise guarantees. | Negative-control class only. |
+
+Every experiment record must carry `noise_policy ∈ {strict-coupled, prefix-shared-seed-matched, uncontrolled}` (refines §5's older `coupled | reused-seed | uncontrolled` enum).
+
+**Hard fallback rule:** if true future-noise coupling cannot be established on the chosen backend, **strict SC1 is NOT achieved.** The project may continue as a product demo or a weaker prefix-shared experiment, but all claims must downgrade to the achieved level and SC1 returns to PROPOSED.
+
+### 2b. SC1 ablation (predeclared) — the predeclared three-branch comparison referenced by CLAIMS.md C019/C020
+
+Every SC1 measurement compares exactly three branches from one factual prefix at fork point t*:
+
+1. **factual branch** — continue with original prompt schedule;
+2. **strict-coupled intervention branch** — apply intervention I, same camera track, future noise held equal to the factual branch by construction;
+3. **uncoupled intervention branch** — same prefix, same intervention I, same camera track, but future-noise-uncoupled (fresh/independent randomness).
+
+SC1 locality = per-sample divergence outside intended-change regions, branch 2 vs branch 3 relative to branch 1's natural drift. SC2 is this comparison made predeclared: hypotheses, metrics, thresholds fixed before generation; it is never a retrospective visual claim.
+
 ## 3. Minimal-change objective
 
 For a generated counterfactual candidate `C`, define a reward vector rather than hiding everything in one scalar:
@@ -80,14 +102,14 @@ These are ideal first targets because they can visibly diverge while leaving arc
 
 These give stronger locality tests but are harder for current generative world models to preserve exactly.
 
-### Tier C — mechanism interventions
+### Tier C — mechanism interventions — POST-SC1 STRETCH WORK
 
 - gravity direction;
 - flooding level dynamics;
 - fire spread or growth dynamics;
 - physical rule change.
 
-These are "wamuuuu" stretch goals and should not block the core demo.
+De-emphasized per the 2026-08-24 adjudication: not part of the core contribution, may not consume GPU time before SC1/SC2 succeed. Additionally, the **first scientific experiment is restricted to viewpoint-preserving or otherwise locality-measurable interventions**: Twin Rollouts §5 shows the locality term becomes vacuous under viewpoint-moving interventions until camera-compensated comparison exists.
 
 ## 5. Branch state
 
@@ -107,7 +129,7 @@ base_prompt
 intervention_spec
 prompt_schedule
 seed
-noise_policy                   # coupled | reused-seed | uncontrolled
+noise_policy                   # strict-coupled | prefix-shared-seed-matched | uncontrolled (SPEC §2a enum)
 sampling_parameters
 metric_vector
 output_artifacts
@@ -130,7 +152,9 @@ metrics(factual, counterfactual, intervention, optional_ground_truth) -> MetricV
 
 The first backend may implement `fork` by storing/reusing a rendered prefix if hidden state cloning is unavailable. Later adapters can clone external world state or latent history.
 
-## 7. Search/controller layer — our learning contribution
+## 7. Search/controller layer — POST-SC1 stretch work
+
+Per the adjudicated ruling, the core contribution is SC1+SC2 (executed controlled coupling + quantified negative control). The phases below remain valid future work but are **explicitly conditional on SC1 success** and must not consume GPU time or narrative weight before then.
 
 ### Phase A: fixed recipe baseline
 

@@ -49,3 +49,11 @@ Record decisions, not brainstorming. Every entry must state what evidence would 
 **Why:** released capabilities, memory, dependency stacks, and i2v conditioning caveats differ materially.
 
 **Reverse if:** preflight research/reproduction shows a clearly superior backend.
+
+## D007 — Thesis re-scoped to SC1/SC2 after sealed prior-art adjudication (2026-08-24)
+
+**Decision:** CausalFork's research contribution is narrowed to exactly two falsifiable targets: **SC1** — first *executed* demonstration of prefix/noise-coupled twin branches inside a released pretrained interactive video world model under a deliberate mid-rollout intervention with per-sample locality vs coupling-off controls — and **SC2** — a quantified negative-control result showing uncoupled/naive forks diverge materially more than coupled branches. Formalism claims are abandoned to Twin Rollouts (arXiv:2608.08982); benchmark/dataset novelty claims are abandoned (2608.11601, 2605.27589, 2607.26452, 2604.20460); intervention-capability claims are abandoned (EVOKE MODE=segment; Genie 3). No paid GPU inference before GF0 (strict fork feasibility) adjudication. Search/controller/RL work is POST-SC1 stretch only. Public wording may not use "first" until SC1 verifies AND the novelty audit is refreshed.
+
+**Evidence:** sealed panel 5/6 + adjudication in `fanin/2026-08-24-novelty/`; canonical update commit (RESEARCH/CLAIMS/SPEC/SOURCES/EXPERIMENTS) countersigned by independent reviewer after one REJECT round fixed pointer/wording defects.
+
+**Reverse if:** Twin Rollouts v2 (or any shipped fork-with-shared-noise implementation on an open interactive video WM) publishes executed experiments before us; or GF0 returns INFEASIBLE on every credible backend and the fallback demo cannot honestly carry the thesis.
