@@ -1,0 +1,416 @@
+"""CausalFork SC1 strict-coupling instrumentation.
+
+ADDED BY PATCH evoke-74d26851-strict-coupling (CausalFork pre-GPU phase P3) on top
+of AlayaLab/Evoke @ 74d268516d95c8fceadd2378f91a73f9f187042b. Everything here is
+env-gated: when no gate env var is set, instrumented call sites reduce to cheap
+early-returns and upstream behaviour (including RNG streams) is unchanged.
+
+Gates
+-----
+EVOKE_STRICT_LEDGER_PATH   filesystem path; when set, every reachable stochastic
+                           site appends one JSON line per actual draw:
+                             event="draw", branch_id, chunk, stage, site_id (R1..R7),
+                             ordinal (per-site, 1-based), seq (global), shape, dtype,
+                             generator_role ("main" | "isolated_warp" | "GLOBAL_FALLBACK"),
+                             generator_state_hash_before / _after,
+                             tensor_sha256 (of the ACTUAL tensor fed to the consuming op),
+                             global_rng_sha256, extra.
+EVOKE_STRICT_BRANCH_ID     branch label for the ledger (default "factual").
+EVOKE_WARP_SEED            PRECOND-1 (upstream da3_cloud covis generator seed);
+                           its presence/sha256 is recorded in ledgers and sidecars.
+EVOKE_STRICT_FORK_JSON     fork-boundary hook config; inline JSON object or a path
+                           to a JSON file:
+                             {"fork_chunk": C, "mode": "capture", "out_dir": DIR}
+                             {"fork_chunk": C, "mode": "restore", "sidecar": JSON}
+                           capture: at the start of chunk C (immediately before the
+                           chunk's prepare_latents draw) snapshot every long-lived
+                           torch.Generator reachable under the SC1 profile (main run
+                           generator; _geo_patchdrop_gen if present) via get_state();
+                           save each state as .pt and record its sha256 in a JSON
+                           sidecar together with EVOKE_WARP_SEED presence/hash.
+                           restore: at the same boundary of the continuing branch,
+                           verify and set_state() every captured state so the branch
+                           resumes the captured stream exactly, then emit the
+                           GENERATOR_STATE_RESTORED marker.
+
+The isolated warp RNG (site R7) is constructed per call from EVOKE_WARP_SEED
+(PRECOND-1); it carries no cross-chunk state, so only env presence/hash is
+recorded rather than a captured state.
+
+NoiseTape.record backs the ledger writes; NoiseTape.replay is an explicit
+PHASE-2 FALLBACK stub (raises NotImplementedError).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import threading
+
+import torch
+
+PATCH_TARGET_PIN = "74d268516d95c8fceadd2378f91a73f9f187042b"
+PATCH_ID = "evoke-74d26851-strict-coupling"
+
+ENV_LEDGER = "EVOKE_STRICT_LEDGER_PATH"
+ENV_BRANCH = "EVOKE_STRICT_BRANCH_ID"
+ENV_FORK = "EVOKE_STRICT_FORK_JSON"
+ENV_WARP_SEED = "EVOKE_WARP_SEED"
+
+CONTINUATION_MARKER = "GENERATOR_STATE_RESTORED"
+
+_LOCK = threading.Lock()
+_ORDINALS = {}
+_CTX = {"branch_id": None, "chunk": None, "stage": None}
+_FORK_CFG = None
+_FORK_CFG_RAW = None
+_LEDGER_FH = None
+_META_WRITTEN = False
+_RESTORED = None
+
+
+def get_branch_id():
+    bid = _CTX.get("branch_id")
+    if bid:
+        return bid
+    return os.environ.get(ENV_BRANCH, "factual")
+
+
+def set_branch_id(bid):
+    _CTX["branch_id"] = bid
+
+
+def set_chunk(k):
+    _CTX["chunk"] = int(k)
+
+
+def set_stage(stage):
+    _CTX["stage"] = None if stage is None else int(stage)
+
+
+def ledger_enabled():
+    return bool(os.environ.get(ENV_LEDGER))
+
+
+def fork_cfg():
+    """Parse EVOKE_STRICT_FORK_JSON (inline JSON object, or a path to one).
+    Re-parses whenever the env value changes, so a single process can run a
+    capture phase followed by a restore phase (G1 paired-run driver)."""
+    global _FORK_CFG, _FORK_CFG_RAW
+    raw = os.environ.get(ENV_FORK)
+    if raw == _FORK_CFG_RAW:
+        return _FORK_CFG
+    cfg = None
+    if raw:
+        txt = raw
+        if not raw.lstrip().startswith("{"):
+            with open(raw, "r", encoding="utf-8") as fh:
+                txt = fh.read()
+        cfg = json.loads(txt)
+    _FORK_CFG = cfg
+    _FORK_CFG_RAW = raw
+    return _FORK_CFG
+
+
+def active():
+    return ledger_enabled() or fork_cfg() is not None
+
+
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _byte_payload(t):
+    tb = t.detach().contiguous().cpu()
+    shape_s, dtype_s = str(list(tb.shape)), str(tb.dtype)
+    try:
+        raw = tb.view(torch.uint8).reshape(-1).numpy().tobytes()
+    except Exception:
+        raw = tb.reshape(-1).to(torch.float64).numpy().tobytes()
+    return raw, shape_s, dtype_s
+
+
+def tensor_sha256(t):
+    if not torch.is_tensor(t):
+        return None
+    raw, shape_s, dtype_s = _byte_payload(t)
+    h = hashlib.sha256()
+    h.update(shape_s.encode()); h.update(b"|"); h.update(dtype_s.encode()); h.update(b"|")
+    h.update(raw)
+    return h.hexdigest()
+
+
+def gen_state_of(generator):
+    """sha256 of the generator's current state; None when inactive or generator None.
+
+    get_state() never advances the stream, so this is observationally neutral.
+    """
+    if not active():
+        return None
+    g = generator[0] if isinstance(generator, list) else generator
+    if g is None:
+        return None
+    st = g.get_state()
+    return sha256_bytes(st.contiguous().reshape(-1).numpy().tobytes())
+
+
+def global_rng_digest():
+    """Digest of the default (global) RNG state; cross-branch divergence is a
+    bypass indicator handled by the validator. None when inactive."""
+    if not active():
+        return None
+    try:
+        st = torch.get_rng_state()
+        return sha256_bytes(st.contiguous().reshape(-1).numpy().tobytes())
+    except Exception:
+        return None
+
+
+class NoiseTape:
+    """Ordered record of instrumented draws; backs the JSONL ledger.
+
+    record(site_key, tensor) is implemented. replay(site_key) is a deliberate
+    PHASE-2 FALLBACK stub: deterministic re-materialization of a recorded draw
+    (e.g. injecting a recorded noise tensor into another backend) is out of scope
+    for this patch and must never be silently approximated.
+    """
+
+    def __init__(self, branch=None):
+        self.branch = branch or get_branch_id()
+        self.entries = []
+
+    def record(self, site_key, tensor, **meta):
+        entry = dict(meta)
+        entry.setdefault("event", "draw")
+        entry["site_id"] = site_key
+        entry["shape"] = list(tensor.shape) if torch.is_tensor(tensor) else None
+        entry["dtype"] = str(tensor.dtype) if torch.is_tensor(tensor) else None
+        entry["tensor_sha256"] = tensor_sha256(tensor)
+        self.entries.append(entry)
+        return entry
+
+    def replay(self, site_key):
+        """PHASE-2 FALLBACK: not implemented in evoke-74d26851-strict-coupling."""
+        raise NotImplementedError(
+            "NoiseTape.replay is a PHASE-2 FALLBACK (planned after G1); "
+            "this patch records draws but provides no replay path."
+        )
+
+    def to_jsonl(self, path):
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            for entry in self.entries:
+                fh.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+_TAPE = NoiseTape()
+
+
+def _ledger_fh():
+    global _LEDGER_FH, _META_WRITTEN
+    if _LEDGER_FH is None:
+        path = os.environ[ENV_LEDGER]
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        _LEDGER_FH = open(path, "a", encoding="utf-8", newline="\n")
+        _META_WRITTEN = False
+    return _LEDGER_FH
+
+
+def _ensure_meta_line():
+    global _META_WRITTEN
+    if _META_WRITTEN:
+        return
+    meta = {
+        "event": "meta",
+        "pin": PATCH_TARGET_PIN,
+        "patch": PATCH_ID,
+        "branch_id": get_branch_id(),
+        "torch": torch.__version__,
+        "warp_seed": _warp_seed_record(),
+        "continuation": _RESTORED,
+        "env_fork_present": os.environ.get(ENV_FORK) is not None,
+    }
+    _LEDGER_FH.write(json.dumps(meta, sort_keys=True) + "\n")
+    _LEDGER_FH.flush()
+    _META_WRITTEN = True
+
+
+def _warp_seed_record():
+    value = os.environ.get(ENV_WARP_SEED)
+    if value is None:
+        return {"present": False, "sha256": None}
+    return {"present": True, "sha256": sha256_bytes(value.encode("utf-8"))}
+
+
+def log_draw(site_id, tensor, generator=None, gen_before=None,
+             generator_role="main", extra=None):
+    """Record one actual draw. Early-return (zero cost) when the ledger is off."""
+    if not ledger_enabled():
+        return None
+    with _LOCK:
+        ordinal = _ORDINALS.get(site_id, 0) + 1
+        _ORDINALS[site_id] = ordinal
+        entry = _TAPE.record(
+            site_id, tensor,
+            seq=len(_TAPE.entries) + 1,
+            ordinal=ordinal,
+            branch_id=get_branch_id(),
+            chunk=_CTX.get("chunk"),
+            stage=_CTX.get("stage"),
+            generator_role=generator_role,
+            generator_state_hash_before=gen_before,
+            generator_state_hash_after=gen_state_of(generator),
+            global_rng_sha256=global_rng_digest(),
+            extra=dict(extra or {}),
+        )
+        _ledger_fh()
+        _ensure_meta_line()
+        _LEDGER_FH.write(json.dumps(entry, sort_keys=True) + "\n")
+        _LEDGER_FH.flush()
+        return entry
+
+
+def collect_generators(main_generator, geo_patchdrop_gen=None):
+    """Names must be stable across branches so sidecars pair up."""
+    g = main_generator[0] if isinstance(main_generator, list) else main_generator
+    out = {}
+    if g is not None:
+        out["main"] = g
+    if geo_patchdrop_gen is not None:
+        out["geo_patchdrop"] = geo_patchdrop_gen
+    return out
+
+
+def maybe_fork_boundary(chunk_index, generators):
+    """Chunk-boundary hook called EVERY chunk; acts only at cfg.fork_chunk."""
+    cfg = fork_cfg()
+    if cfg is None:
+        return None
+    if int(cfg.get("fork_chunk", -(10 ** 9))) != int(chunk_index):
+        return None
+    mode = str(cfg.get("mode", "capture")).lower()
+    if mode == "capture":
+        return _fork_capture(cfg, int(chunk_index), generators)
+    if mode == "restore":
+        return _fork_restore(cfg, int(chunk_index), generators)
+    raise ValueError("[StrictFork] unknown mode: %r" % (mode,))
+
+
+def _fork_capture(cfg, chunk_index, generators):
+    out_dir = cfg.get("out_dir")
+    if not out_dir:
+        raise ValueError("[StrictFork] capture mode requires out_dir")
+    os.makedirs(out_dir, exist_ok=True)
+    gens_json = {}
+    for name in sorted(generators):
+        g = generators[name]
+        st = g.get_state().cpu().contiguous()
+        raw = st.reshape(-1).numpy().tobytes()
+        digest = sha256_bytes(raw)
+        pt_path = os.path.join(out_dir, "genstate_%s_chunk%d.pt" % (name, chunk_index))
+        torch.save({"name": name, "chunk": chunk_index, "pin": PATCH_TARGET_PIN, "state": st}, pt_path)
+        gens_json[name] = {"path": pt_path, "sha256": digest, "nbytes": len(raw)}
+    sidecar = {
+        "kind": "EVOKE_STRICT_FORK_CAPTURE",
+        "pin": PATCH_TARGET_PIN,
+        "patch": PATCH_ID,
+        "branch_id": get_branch_id(),
+        "fork_chunk": chunk_index,
+        "generators": gens_json,
+        "warp_seed": _warp_seed_record(),
+        "global_rng_sha256": global_rng_digest(),
+        "torch": torch.__version__,
+        "created_utc": _utcnow(),
+    }
+    sc_path = os.path.join(out_dir, "fork_capture_chunk%d.json" % chunk_index)
+    with open(sc_path, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(sidecar, fh, indent=2, sort_keys=True)
+    print("[StrictFork] FORK_CAPTURE branch=%s chunk=%d gens=%s -> %s"
+          % (get_branch_id(), chunk_index, sorted(gens_json), sc_path), flush=True)
+    if ledger_enabled():
+        with _LOCK:
+            _ledger_fh()
+            _ensure_meta_line()
+            _LEDGER_FH.write(json.dumps({
+                "event": "FORK_CAPTURE", "branch_id": get_branch_id(),
+                "chunk": chunk_index, "generators": sorted(gens_json),
+                "sidecar": sc_path,
+            }, sort_keys=True) + "\n")
+            _LEDGER_FH.flush()
+    return sc_path
+
+
+def _fork_restore(cfg, chunk_index, generators):
+    side = cfg.get("sidecar")
+    if not side:
+        raise ValueError("[StrictFork] restore mode requires sidecar")
+    with open(side, "r", encoding="utf-8") as fh:
+        meta = json.load(fh)
+    if meta.get("kind") != "EVOKE_STRICT_FORK_CAPTURE":
+        raise RuntimeError("[StrictFork] sidecar kind mismatch: %r" % (meta.get("kind"),))
+    if meta.get("pin") != PATCH_TARGET_PIN:
+        raise RuntimeError("[StrictFork] sidecar pin %r != patched pin" % (meta.get("pin"),))
+    if int(meta.get("fork_chunk", -1)) != chunk_index:
+        raise RuntimeError("[StrictFork] sidecar fork_chunk %r != boundary %d"
+                           % (meta.get("fork_chunk"), chunk_index))
+    restored = []
+    for name in sorted(meta.get("generators", {})):
+        info = meta["generators"][name]
+        g = generators.get(name)
+        if g is None:
+            raise RuntimeError("[StrictFork] restore: generator %r absent at boundary" % (name,))
+        obj = torch.load(info["path"], map_location="cpu", weights_only=True)
+        st = obj["state"]
+        raw = st.contiguous().reshape(-1).numpy().tobytes()
+        if sha256_bytes(raw) != info["sha256"]:
+            raise RuntimeError("[StrictFork] captured state hash mismatch for %r" % (name,))
+        g.set_state(st.to(torch.uint8))
+        restored.append(name)
+    global _RESTORED
+    with _LOCK:
+        _RESTORED = CONTINUATION_MARKER
+        rec = {
+            "event": CONTINUATION_MARKER,
+            "branch_id": get_branch_id(),
+            "chunk": chunk_index,
+            "restored_generators": restored,
+            "sidecar": side,
+        }
+        if ledger_enabled():
+            _ledger_fh()
+            _ensure_meta_line()
+            _LEDGER_FH.write(json.dumps(rec, sort_keys=True) + "\n")
+            _LEDGER_FH.flush()
+    print("[StrictFork] GENERATOR_STATE_RESTORED branch=%s chunk=%d gens=%s"
+          % (get_branch_id(), chunk_index, restored), flush=True)
+    return rec
+
+
+def continuation_marker():
+    return _RESTORED
+
+
+def _utcnow():
+    import datetime
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def reset_for_tests():
+    """Isolate module state between unit tests (not used on the engine path)."""
+    global _FORK_CFG, _FORK_CFG_RAW, _LEDGER_FH, _META_WRITTEN, _RESTORED
+    with _LOCK:
+        _ORDINALS.clear()
+        _CTX.update({"branch_id": None, "chunk": None, "stage": None})
+        _FORK_CFG = None
+        _FORK_CFG_RAW = None
+        if _LEDGER_FH is not None:
+            try:
+                _LEDGER_FH.close()
+            except Exception:
+                pass
+        _LEDGER_FH = None
+        _META_WRITTEN = False
+        _RESTORED = None
+        _TAPE.entries.clear()

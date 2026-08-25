@@ -1,0 +1,131 @@
+﻿{
+  "$schema": "causalfork/sc1-strict-profile/v1",
+  "profile_id": "sc1_strict",
+  "created_utc": "2026-08-25",
+  "author_agent": "ox-alpha (P1+P2 pre-GPU review)",
+  "upstream_pin": {
+    "repo": "AlayaLab/Evoke",
+    "commit": "74d268516d95c8fceadd2378f91a73f9f187042b",
+    "clone_path_readonly": "C:\\Users\\HP\\AppData\\Local\\Temp\\opencode\\evoke-pin",
+    "checkout_verified": true,
+    "worktree_clean": true
+  },
+  "engine_path": {
+    "launcher": "scripts/inference/infer_post_distill.sh",
+    "driver": "scripts/inference/infer_batch.py",
+    "engine": "scripts/inference/infer_single.py",
+    "pipeline_class": "evoke.pipelines.pipeline_evoke.EvokePipeline (infer_single.py:766)",
+    "scheduler": "evoke.diffusers_version.scheduling_evoke_diffusers.EvokeScheduler (infer_single.py:768)",
+    "mode": "i2v + segment prompt schedule (engine sample_type=i2v)",
+    "geo_on": "GEO_ON = MODE != t2v and WARP == on (infer_batch.py:116) => true"
+  },
+  "fork_definition": {
+    "fork_point": "chunk boundary c* = first post-prefix chunk; chunk = 33 px frames = 9 latent frames (latent_window_size=9, vae_t_stride=4)",
+    "shared_prefix_artifact": "decoded chunk pixels [0, c*) + pipeline state at the boundary (FrameBank store, persistent VAE feat map) must be byte-identical; guaranteed by same seed + byte-identical config + deterministic draw sequence",
+    "divergence_policy": "prompt_schedule_only",
+    "mechanism": "chunk_prompts dict -> text embeddings encoded upfront (pipeline_evoke.py:2019-2022), selected per chunk (:2413-2416). Text-embedding ONLY; warp/camera/frame-bank/RNG path untouched",
+    "event_chunks_must_be": "empty list [] in BOTH branches (NOT the intervention mechanism)"
+  },
+  "byte_identical_operational_definition": {
+    "config_hash": "SHA256 over canonical JSON of {all infer_batch env exports used by recipe path} x {resolved argv to infer_single incl. --seed} x {jsonl row minus keys [prompt, prompt_schedule]} x {EVOKE_WARP_SEED value} x {checkpoint dir hashes}",
+    "excluded_fields_prompt_only": ["prompt", "prompt_schedule contents"],
+    "negative_prompt_NOT_excluded": true,
+    "everything_else_must_hash_equal_across_branches": true
+  },
+  "required_identical_fields": [
+    "seed (single torch.Generator(device=device).manual_seed(seed), infer_single.py:1434)",
+    "EVOKE_WARP_SEED env (MANDATORY export; da3_cloud.py:1475-1476)",
+    "height=384 width=640 fps=24 num_chunks (short rollout)",
+    "lingbot_pose_path / pose bytes (camera trajectory); image_path (source frame)",
+    "guidance_scale=1.0",
+    "is_enable_stage2=true stage2_num_stages=3 stage2_steps=[1,1,1] num_inference_steps=3(ignored)",
+    "vae_decode_type=persistent",
+    "warp_noise_sigma_min=0.0 warp_noise_sigma_max=0.135 warp_noise_sigma_invisible=1.0 visibility_aware_noise=true",
+    "geo_da3_render_mode=backward_zbuf geo_bw_fill_iters=12 geo_zbuf_despeckle=false",
+    "geo_depth_backend=vigeo stage2_warp_compression_mode=fixed_mem",
+    "use_geometric_state=true geo_warp_stage0_only=true geo_chunk0_ref_warp=true(default)",
+    "history_sizes=[16,2,1] is_keep_x0=true",
+    "image_noise_sigma_min=0.0 image_noise_sigma_max=0.0",
+    "negative_prompt restrict_self_attn=false use_kv_cache=false use_dmd=false"
+  ],
+  "forbidden_mechanisms": [
+    {"name": "event_chunks as intervention", "reason": "SC1 divergence is prompt-schedule-only; event_chunks drops warp/static-cam/skips bank and MUST be empty+identical (pipeline_evoke.py:1811-1815, 2404-2410)"},
+    {"name": "camera/pose divergence at or after fork", "reason": "future camera trajectory must be identical"},
+    {"name": "seed or config delta other than prompt fields", "reason": "paired-draw guarantee"},
+    {"name": "any DISABLE_FOR_SC1 option switched on in exactly one branch", "reason": "adds/removes RNG calls, breaks stream alignment"}
+  ],
+  "preconditions_conditional_blockers": [
+    {
+      "id": "PRECOND-1",
+      "statement": "EVOKE_WARP_SEED must be exported to a fixed derived value before launch; else zbuf covis subsample (da3_cloud.py:1486-1487) draws from GLOBAL CUDA RNG (_cgen=None) and becomes irreproducible run-to-run.",
+      "note": "Global-RNG draws do NOT desync the explicit per-run generator (separate Generator object), but they void run-level reproducibility of warp source selection.",
+      "if_unmet": "UNKNOWN_BLOCKER appears; SC1 strict invalid; downgrade to unpaired observational protocol."
+    },
+    {
+      "id": "PRECOND-2",
+      "statement": "G1 must assert pre-rollout that transformer, vae, text_encoder and loaded estimator modules are eval() (no explicit .eval() found on engine path; from_pretrained defaults to eval; DiT dropout p=0.0 makes it numerically moot, third_party DropPath gates on .training).",
+      "if_unmet": "UNKNOWN_BLOCKER appears; SC1 strict invalid."
+    }
+  ],
+  "unknown_blockers": [],
+  "unknown_blockers_note": "None found statically under shipped flags. Strict validity is CONDITIONAL on PRECOND-1/PRECOND-2 (both CPU-verifiable pre-launch). If unmet => UNKNOWN_BLOCKER>0 => strict invalid, report honestly.",
+  "option_classification": [
+    {"option": "sample_type=i2v", "class": "SAFE", "evidence": "infer_batch.py:476", "note": "conditioning selection; zero-shot for v2v-trained ckpt; identical both branches"},
+    {"option": "prompt_schedule JSON / chunk_prompts", "class": "INSTRUMENT", "evidence": "infer_batch.py:474; infer_single.py:1528; pipeline_evoke.py:1823,2019-2022,2413-2416", "note": "THE divergence lever; text-embedding only, zero RNG impact"},
+    {"option": "GUIDANCE_SCALE=1.0 CFG off", "class": "SAFE", "evidence": "do_classifier_free_guidance=_guidance_scale>1.0 (pipeline_evoke.py:1700-1701); uncond block :1281-1320 dead", "note": "verified ZERO extra forwards and ZERO draws at 1.0"},
+    {"option": "IS_STAGE2=1 STAGES=3 STEPS=[1,1,1]", "class": "INSTRUMENT", "evidence": "infer_batch.py:419-422; renoise pipeline_evoke.py:1460-1485 -> sample_block_noise :573", "note": "2 correlated-noise draws/chunk from main generator"},
+    {"option": "NUM_INFERENCE_STEPS=3", "class": "SAFE", "evidence": "ignored under pyramid (shell warning; steps from STAGE2_STEPS)"},
+    {"option": "RESTRICT=0 (restrict_self_attn/use_kv_cache off)", "class": "SAFE-as-shipped | DISABLE_FOR_SC1-if-on", "evidence": "shell RESTRICT=0; defaults false infer_single.py:481,484", "note": "mutable cross-step cache = hidden state; if enabled later, reclassify UNKNOWN_BLOCKER"},
+    {"option": "GEO_WARP_STAGE0_ONLY=1", "class": "SAFE", "evidence": "infer_batch.py:457; warp stripped at i_s>0 (pipeline_evoke.py:1384-1387)"},
+    {"option": "WARP_SIGMA_MAX=0.135 min=0.0 inv=1.0 visibility_aware_noise=true", "class": "INSTRUMENT", "evidence": "infer_batch.py:437,439; cfg inject infer_single.py:913-917; ACTIVE branch pipeline_evoke.py:980-997 (uniform fallback :998-1005 dormant)", "note": "visibility-aware spatial sigma noise ACTIVE"},
+    {"option": "NOISE_CENTER=0", "class": "SAFE", "evidence": "warp_rope_noise_center_align False unless flagged (infer_single.py:1519-1523; pipeline_evoke.py:2788-2789)"},
+    {"option": "RENDER_MODE=backward_zbuf BW_FILL_ITERS=12", "class": "INSTRUMENT", "evidence": "_render_backward_multisrc_zbuf selected (pipeline_evoke.py:816-819); covis randint da3_cloud.py:1486-1487", "note": "fill_iters accepted-but-IGNORED on zbuf path (da3_cloud.py:1452); covis = the one warp-side RNG site; isolated generator mandated (PRECOND-1)"},
+    {"option": "ZBUF_DESPECKLE=0", "class": "SAFE", "evidence": "block bypassed when false, byte-identical to original (da3_cloud.py:1454-1458)"},
+    {"option": "DEPTH_BACKEND=vigeo", "class": "INSTRUMENT", "evidence": "infer_batch.py:446,455; vigeo_cloud.py + third_party/vigeo have NO inference-time RNG (grep clean; param-init randn at weight load only)", "note": "estimator kernel determinism = G1 empirical check, not an RNG-ledger item"},
+    {"option": "WARP_MODE=fixed_mem", "class": "SAFE", "evidence": "stage2_warp_compression_mode=fixed_mem (infer_single.py:1515-1518)"},
+    {"option": "VAE_DECODE_TYPE=persistent", "class": "INSTRUMENT", "evidence": "_decode_chunk_persistent_cache :438+, _geo_persist_feat_map :467-473,516,3044; vae.clear_cache() :956-958", "note": "cross-chunk MUTABLE state; deterministic given identical latents; shared prefix guarantees identical state at fork; decode path has ZERO RNG (grep)"},
+    {"option": "HEIGHT/WIDTH/FPS 384/640/24", "class": "SAFE"},
+    {"option": "SEED", "class": "INSTRUMENT", "evidence": "torch.Generator(device).manual_seed (infer_single.py:1434)", "note": "root of RNG ledger; required_identical"},
+    {"option": "geo_chunk0_ref_warp=True default-on", "class": "INSTRUMENT", "evidence": "default True (infer_single.py:173); gate pipeline_evoke.py:798-803; build_single_source_warp_mono body RNG-FREE (da3_cloud.py:1857-1950 grep verified)", "note": "'non-reproducible' reputation NOT confirmed at RNG level; renders deterministically from shared ref image; residual risk = estimator kernels (G1 check)"},
+    {"option": "geo_warp_vis_cap=0.0 default", "class": "DISABLE_FOR_SC1-if-on", "evidence": "Bayer dither thinning pipeline_evoke.py:1076-1085 (RNG-free dither, data-dependent keep_frac)", "note": "must stay 0; absent from shipped argv"},
+    {"option": "geo_warp_patch_drop_ratio=0.0 default", "class": "DISABLE_FOR_SC1-if-on", "evidence": "persistent _geo_patchdrop_gen seeded from args.seed (pipeline_evoke.py:1092-1100; seed wiring infer_single.py:926,1116-1117)", "note": "second long-lived RNG stream across chunks; must stay 0"},
+    {"option": "invisible_history_noise=False default", "class": "DISABLE_FOR_SC1-if-on", "evidence": "randn_like pipeline_evoke.py:1019,1023; double-gated (flag AND video_latents None)", "note": "intentionally not passed (infer_batch.py:462-463)"},
+    {"option": "short_tier_noise_enabled=False (+sigma_lock_per_rollout)", "class": "DISABLE_FOR_SC1-if-on", "evidence": "rollout lock rand :2340-2342; per-chunk rand :2708 + randn_tensor :2710; closure :2700-2717; reset :2328-2329", "note": "drains main generator variable times/chunk"},
+    {"option": "use_adaptive_anti_drifting=False never passed", "class": "DISABLE_FOR_SC1-if-on", "evidence": "drift-triggered corruption :2999-3010 -> AdaptiveAntiDrifting.apply_frame_aware_corruption -> randn_like utils_base.py:909", "note": "data-dependent control flow adding RNG = worst case for pairing; helper never constructed (grep clean)"},
+    {"option": "use_dmd=False", "class": "DISABLE_FOR_SC1-if-on", "evidence": "USE_DMD default 0 (infer_batch.py:129); DMD renoise :1330-1337 dormant", "note": "changes timestep algebra + adds draws"},
+    {"option": "use_cfg_zero_star=False", "class": "SAFE", "evidence": "default False :1402; optimized_scale path :1306-1318 dormant"},
+    {"option": "use_interpolate_prompt=False", "class": "SAFE", "evidence": "default False :1765"},
+    {"option": "event_chunks=[]", "class": "SAFE-as-empty | FORBIDDEN-as-mechanism", "evidence": "empty _event_set -> is_event_k always False, _geo_pose_k==k, baseline byte-for-byte (:2404-2410); hooks :2603-2615 dormant"},
+    {"option": "stream_output/save_chunk_segments/joystick_hud/bg_postprocess/dump_geo_intermediates", "class": "SAFE", "evidence": "post-decode I/O + viz burn-in only, downstream of all RNG sites"},
+    {"option": "GEO_HIST_MAX_FRAMES", "class": "SAFE-at-default | DISABLE_FOR_SC1-if-set", "evidence": "bounds DA3 point cloud => changes warp input AND store sizes => changes covis draw counts (shell -h)", "note": "must remain unset/0 both branches"},
+    {"option": "FrameBank admission gates consist_gate/probation/self_reanchor", "class": "SAFE-at-defaults", "evidence": "all default False/0 (da3_cloud.py:476-482)", "note": "bank membership purely schedule-determined => len(ids_all) identical across branches => covis draw COUNT aligned; enabling any gate => reclassify covis site UNKNOWN_BLOCKER"},
+    {"option": "dropout/eval-mode enforcement", "class": "INSTRUMENT", "evidence": "transformer dropout 0.0 (transformer_evoke.py:596); NO explicit .eval() on engine path (grep); from_pretrained defaults eval", "note": "PRECOND-2: G1 asserts all modules .training==False pre-rollout"},
+    {"option": "sample_block_noise generator=None fallback", "class": "INSTRUMENT-note", "evidence": "fresh Generator fallback 'non-deterministic' (pipeline_evoke.py:552-554)", "note": "NEVER taken on engine path (generator always passed, infer_single.py:1485); documented hazard"}
+  ],
+  "reachable_post_fork_random_sites_summary": {
+    "count": 7,
+    "sites": [
+      "pipeline_evoke.py:371 prepare_latents per-chunk DiT noise randn_tensor (called :2791) - main generator",
+      "pipeline_evoke.py:424 warp first-frame VAE encode latent_dist.sample (via :965) - main generator",
+      "pipeline_evoke.py:432 warp chunk VAE encode latent_dist.sample (via :965) - main generator",
+      "pipeline_evoke.py:977 warp frame_sigmas torch.rand(9) - main generator",
+      "pipeline_evoke.py:996 visibility-aware warp noise randn_tensor - main generator",
+      "pipeline_evoke.py:573 sample_block_noise torch.randn (invoked 2x/chunk via :1474, stages i_s=1,2) - main generator",
+      "da3_cloud.py:1486-87 zbuf covis subsample torch.randint(M) - ISOLATED generator (EVOKE_WARP_SEED mandated)"
+    ],
+    "invariant_statement": "REACHABLE_POST_FORK_RANDOM_SITE_COUNT (7) == INSTRUMENTED_OR_EXPLICITLY_DISABLED coverage of those sites (7 instrumented); UNKNOWN count = 0 conditional on PRECOND-1/PRECOND-2",
+    "full_ledger": "profiles/sc1_stochastic_site_inventory.md"
+  },
+  "verification_methods": [
+    "git rev-parse HEAD == pinned commit; worktree clean",
+    "Grep battery over evoke/ + scripts/ (*.py): randn_like|torch.randn|randn_tensor; torch.rand(|torch.randint|torch.normal|multinomial|bernoulli|exponential_; latent_dist.sample|manual_seed|get_state|set_state; Generator|np.random|random-module usage",
+    "Import-graph tracing: sf_warp_rollout <- utils_evoke_post (training only); engine imports from online_materialize limited to _geo_resize_visibility_to_latent (verified RNG-free)",
+    "Recipe-path reconstruction: shell exports -> infer_batch argv (405-484) -> infer_single defaults + pipe_kwargs (1464-1560) -> pipe signature defaults (1747-1815)",
+    "CFG dead-branch proof: property pipeline_evoke.py:1700-1701"
+  ],
+  "gate_status": "P1/P2 authored; UNVERIFIED pending independent reviewer verification + G1 execution",
+  "reproduction": {
+    "to_rebuild_this_profile": "re-run grep battery vs evoke-pin @ 74d268516d95c8fceadd2378f91a73f9f187042b; classifications cite file:line",
+    "cpu_mock_hook": "all 7 reachable sites accept injected generator; CPU harness can drive EvokePipeline device=cpu, tiny shapes (64x64, 1 chunk), stubbed estimators to exercise exact draw sequence before Colab"
+  }
+}
