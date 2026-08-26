@@ -7,8 +7,11 @@ Machine-readable counterpart: `profiles/sc1_strict_profile.json`. Full RNG ledge
 
 ## Fork semantics
 
-- A **chunk** is 33 pixel frames = 9 latent frames (`latent_window_size=9`, VAE temporal stride 4).
-- The fork sits at a **chunk boundary `c*`** (first post-prefix chunk). Chunks `0..c*-1` are generated
+- A **VAE valid window** covers 33 pixel frames = 9 latent frames (`latent_window_size=9`, VAE
+  temporal stride 4). The **rollout/prompt chunk stride** is 36 pixel frames. Window and stride are
+  **distinct quantities** - a chunk is identified by its stride position, never by the window size.
+- The fork sits at a **chunk boundary `c*`** (first post-prefix chunk). Fork identity is always
+  **chunk-index based**, never pixel-frame based. Chunks `0..c*-1` are generated
   identically in both branches and frozen as the **shared prefix artifact** (decoded pixels plus the
   pipeline state that crosses the boundary: FrameBank store, persistent-VAE feature cache).
 - The **only** divergence is the prompt: the CF branch passes `chunk_prompts` entries with keys >= c*

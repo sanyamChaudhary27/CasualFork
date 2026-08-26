@@ -1,60 +1,73 @@
-"""SC1 strict-coupling validator (CausalFork pre-GPU phase P3, item C).
+"""SC1 STRICT-COUPLING VALIDATOR V2 (STAGE-B/C fix round; supersedes v1).
 
-Compares two stochastic-site ledger files produced by the patched Evoke tree
-(patches/evoke-74d26851-strict-coupling.patch, evoke/strict_fork.py) and decides,
-with machine-readable reasons, whether a factual/counterfactual branch pair is
+Binding inputs: fanin/2026-08-25-semantics/adjudication.md (sealed 3-way,
+2026-08-25). v1 verdicts are BARRED from gate evidence (Auditor B ruling);
+v2 closes every v1 hole and adds site-aware comparison semantics.
 
-    STRICT_NOISE_COUPLED        every reachable post-fork site drew byte-identical
-                                noise from identically-evolving generators, with no
-                                bypass indicators; or
-    STRICT_COUPLING_INVALID     any violation whatsoever (reason codes listed below).
+Verdicts
+--------
+STRICT_NOISE_COUPLED      every reachable post-fork stochastic site behaved
+                          exactly as its adjudicated class requires.
+STRICT_COUPLING_INVALID   any violation whatsoever (machine-readable reasons).
 
-GENERATOR_STATE_RESTORED is NOT a coupling verdict. It is the continuation label
-for a branch that resumed from captured generator states at the fork boundary;
-it appears only under result["continuation"] / result["restored_branches"] and is
-rejected if anyone tries to use it as a coupling status (validate_status()).
+Entry point
+-----------
+    validate_pair(factual_log, cf_log, pair_manifest,
+                  factual_role="factual", cf_role="counterfactual")
 
-Reason codes
-------------
-MISSING_SITE:<site>            required reachable site absent from a branch log
-MISSING_SITE:<site>#<ord>      aligned draw absent in one branch
-UNEXPECTED_SITE:<site>         site outside the required inventory appeared
-ORDINAL_MISMATCH:<site>        per-site ordinal sets differ across branches
-FIELD_MISMATCH:<f>@<k>         aligned metadata differs (chunk/stage/shape/dtype/
-                               generator_state_hash_*/generator_role)
-TENSOR_MISMATCH@<k>            tensor_sha256 differs for an aligned draw
-STREAM_CHAIN_BREAK:<k>         declared generator stream did not evolve contiguously
-NOOP_DRAW_BYPASS:<k>           recorded draw left its generator state unchanged
-PRECOND1_GLOBAL_RNG_BYPASS@<k> R7 drew from the global RNG (EVOKE_WARP_SEED unset)
-GLOBAL_RNG_DIVERGENCE@<k>      global-RNG digest differs across aligned draws
-RESTORE_METADATA_MISMATCH      continuation claim malformed/inconsistent
-TERMINOLOGY_VIOLATION          continuation label misused / unknown status string
+The PAIR MANIFEST (third argument) is REQUIRED: it binds both ledgers to one
+pair_id, distinct run_ids, the profile/patch/config hashes, fork_chunk and the
+FORK_STATE_DIGEST artifacts. compare_coupling_logs() is kept as a thin alias.
+
+Site comparison policy (adjudication table, binding):
+  R1 R4 R5 R6  EXACT_TENSOR             tensor_sha256 equality required
+  R2 R3        STREAM_WITNESS           gen-state bracket + shape/count;
+                                        diagnostics sha256_input_pixels/mean/std
+                                        byte-equal at chunk<=fork_chunk;
+                                        recorded-only after divergence begins;
+                                        z-tensor equality NOT required there
+  R7           ISOLATED_STREAM_WITNESS  per-draw state chain per render call;
+                                        chains must match until the first
+                                        EXPLAINED domain divergence (high/skip
+                                        difference); index tensor NEVER compared
+
+v1 holes closed: self-pair guard, explicit roles+label enforcement, distinct
+run_ids/pair_id, single meta header, full meta comparison (pin, patch sha,
+profile sha, torch/diffusers strings, warp seed, common config, fork_chunk),
+event validation (FORK_CAPTURE / GENERATOR_STATE_RESTORED at fork_chunk before
+any post-fork draw), lazy continuation fix (restored_branches come from real
+restore events), pair-manifest binding with artifact hashes, unique-ledger /
+append-mixing detection via run_id/pair_id on every line.
 """
-
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 
 STRICT_NOISE_COUPLED = "STRICT_NOISE_COUPLED"
 STRICT_COUPLING_INVALID = "STRICT_COUPLING_INVALID"
 GENERATOR_STATE_RESTORED = "GENERATOR_STATE_RESTORED"
-
 COUPLING_STATUSES = (STRICT_NOISE_COUPLED, STRICT_COUPLING_INVALID)
 
 REQUIRED_SITES = ("R1", "R2", "R3", "R4", "R5", "R6", "R7")
 MAIN_STREAM_SITES = ("R1", "R2", "R3", "R4", "R5", "R6")
 ISOLATED_SITES = ("R7",)
+EXACT_TENSOR_SITES = ("R1", "R4", "R5", "R6")
+STREAM_WITNESS_SITES = ("R2", "R3")
 
-REQUIRED_ENTRY_FIELDS = (
-    "site_id", "ordinal", "tensor_sha256", "shape", "dtype",
-    "generator_state_hash_before", "generator_state_hash_after", "generator_role",
+MANIFEST_SCHEMA = "causalfork/sc1-pair-manifest@2"
+MANIFEST_REQUIRED_FIELDS = (
+    "schema", "pair_id", "run_ids", "upstream_pin", "patch_sha256",
+    "profile_sha256", "common_config_sha256", "fork_chunk",
+    "parent_state_digest", "child_state_digest",
 )
 
-COMPARED_FIELDS = (
-    "chunk", "stage", "shape", "dtype", "tensor_sha256",
-    "generator_state_hash_before", "generator_state_hash_after",
-    "generator_role", "global_rng_sha256",
-)
+CORE_ENTRY_FIELDS = ("site_id", "ordinal", "tensor_sha256", "shape", "dtype")
+STREAM_ENTRY_FIELDS = ("generator_state_hash_before", "generator_state_hash_after")
+COMPARED_FIELDS = ("chunk", "stage", "shape", "dtype")
+
+R2_R3_DIAG_FIELDS = ("sha256_input_pixels", "sha256_mean", "sha256_std")
 
 
 def validate_status(status):
@@ -68,24 +81,34 @@ def validate_status(status):
     return status
 
 
-def _read_lines(source):
+def is_pass(result):
+    return result.get("status") == STRICT_NOISE_COUPLED
+
+
+# ---------------------------------------------------------------- ledger I/O --
+def _read_text(source):
+    """Resolve a log source (path | JSONL text | file handle) to text."""
     if hasattr(source, "read"):
-        return source.read().splitlines()
+        return source.read()
     if isinstance(source, str):
-        import os
         if os.path.exists(source):
             with open(source, "r", encoding="utf-8") as fh:
-                return fh.read().splitlines()
+                return fh.read()
         if source.lstrip().startswith("{"):
-            return source.splitlines()
-        raise ValueError("ledger source not found and not JSONL text: %r" % source[:80])
+            return source
+        raise ValueError("ledger source not found and not JSONL text: %r"
+                         % source[:80])
     raise TypeError("unsupported ledger source: %r" % type(source))
 
 
 def load_log(source):
-    """Return (meta_dict, entries, events). Raises ValueError on parse errors."""
-    meta, entries, events = {}, [], []
-    for lineno, line in enumerate(_read_lines(source), 1):
+    """Parse one ledger -> dict(metas=[...], entries=[...], events=[...], text=...).
+
+    Raises ValueError on JSON parse errors. Does NOT decide multi-meta here.
+    """
+    text = _read_text(source)
+    metas, entries, events = [], [], []
+    for lineno, line in enumerate(text.splitlines(), 1):
         line = line.strip()
         if not line:
             continue
@@ -95,179 +118,482 @@ def load_log(source):
             raise ValueError("parse error at line %d: %s" % (lineno, exc))
         event = obj.get("event")
         if event == "meta":
-            meta = obj
+            metas.append(obj)
         elif event == "draw":
             entries.append(obj)
         elif event is not None:
             events.append(obj)
-    return meta, entries, events
+    return {"metas": metas, "entries": entries, "events": events, "text": text}
 
 
-def _key(entry):
-    return (entry.get("site_id"), entry.get("ordinal"))
+def _key(e):
+    return (e.get("site_id"), e.get("ordinal"), e.get("chunk"))
 
 
-def _continuation_of(meta, explicit, branch_label, reasons):
-    """Resolve the continuation claim for one branch; enforce terminology."""
-    value = explicit if explicit is not None else meta.get("continuation")
-    if value is None:
-        return None
-    if value != GENERATOR_STATE_RESTORED:
-        reasons.append("TERMINOLOGY_VIOLATION:%s continuation=%r" % (branch_label, value))
-        reasons.append("RESTORE_METADATA_MISMATCH:%s" % branch_label)
-        return None
-    return value
-
-
-CORE_ENTRY_FIELDS = ("site_id", "ordinal", "tensor_sha256", "shape", "dtype")
-STREAM_ENTRY_FIELDS = ("generator_state_hash_before", "generator_state_hash_after")
-
-
-def _intra_log_checks(entries, branch_label, reasons):
-    seen_pairs = set()
-    ordered = sorted(entries, key=lambda e: e.get("seq", 0))
-    last_main_after = None
-    for e in ordered:
-        site = e.get("site_id")
-        ordinal = e.get("ordinal")
-        k = "%s#%s" % (site, ordinal)
-        for f in CORE_ENTRY_FIELDS:
-            if e.get(f) is None:
-                reasons.append("FIELD_MISMATCH:none@%s (%s missing in %s)" % (k, f, branch_label))
-        pair = (site, ordinal)
-        if pair in seen_pairs:
-            reasons.append("ORDINAL_MISMATCH:%s duplicate ordinal %r in %s"
-                           % (site, ordinal, branch_label))
-        seen_pairs.add(pair)
-        if site in ISOLATED_SITES:
-            if e.get("generator_role") != "isolated_warp":
-                reasons.append("PRECOND1_GLOBAL_RNG_BYPASS@%s role=%r"
-                               % (k, e.get("generator_role")))
-            continue  # isolated stream: excluded from the main-stream chain
-        for f in STREAM_ENTRY_FIELDS:
-            if e.get(f) is None:
-                reasons.append("FIELD_MISMATCH:none@%s (%s missing in %s)" % (k, f, branch_label))
-        before = e.get("generator_state_hash_before")
-        after = e.get("generator_state_hash_after")
-        if before is not None and after is not None:
-            if before == after:
-                reasons.append("NOOP_DRAW_BYPASS:%s" % k)
-            if last_main_after is not None and before != last_main_after:
-                reasons.append("STREAM_CHAIN_BREAK:%s" % k)
-        last_main_after = after if after is not None else last_main_after
-
-
-def compare_coupling_logs(factual_log, cf_log, factual_meta=None, cf_meta=None):
-    """Compare factual vs counterfactual strict-coupling ledgers.
-
-    Returns a dict; NEVER mutates inputs. The overall verdict is under "status".
-    """
-    reasons = []
-    try:
-        f_meta, f_entries, f_events = load_log(factual_log)
-    except ValueError as exc:
-        return _invalid(["LEDGER_PARSE_ERROR:factual:%s" % exc])
-    try:
-        c_meta, c_entries, c_events = load_log(cf_log)
-    except ValueError as exc:
-        return _invalid(["LEDGER_PARSE_ERROR:counterfactual:%s" % exc])
-
-    continuation = {
-        "factual": _continuation_of(f_meta, factual_meta, "factual", reasons),
-        "counterfactual": _continuation_of(c_meta, cf_meta, "counterfactual", reasons),
-    }
-    restored_branches = [b for b, v in continuation.items() if v == GENERATOR_STATE_RESTORED]
-
-    # ---- coverage / alignment ------------------------------------------------
-    f_keys = [_key(e) for e in f_entries]
-    c_keys = [_key(e) for e in c_entries]
-    f_set, c_set = set(f_keys), set(c_keys)
-
-    f_sites = {s for s, _ in f_set}
-    c_sites = {s for s, _ in c_set}
-    for site in REQUIRED_SITES:
-        if site not in f_sites:
-            reasons.append("MISSING_SITE:%s (factual)" % site)
-        if site not in c_sites:
-            reasons.append("MISSING_SITE:%s (counterfactual)" % site)
-    for site in sorted((f_sites | c_sites) - set(REQUIRED_SITES)):
-        reasons.append("UNEXPECTED_SITE:%s" % site)
-
-    for key in sorted(f_set - c_set):
-        reasons.append("MISSING_SITE:%s#%s (counterfactual)" % key)
-    for key in sorted(c_set - f_set):
-        reasons.append("MISSING_SITE:%s#%s (factual)" % key)
-    for site in sorted(f_sites & c_sites):
-        f_ords = sorted(o for s, o in f_set if s == site)
-        c_ords = sorted(o for s, o in c_set if s == site)
-        if f_ords != c_ords:
-            reasons.append("ORDINAL_MISMATCH:%s factual=%s counterfactual=%s"
-                           % (site, f_ords, c_ords))
-
-    # ---- aligned field equality ---------------------------------------------
-    f_by_key = {_key(e): e for e in f_entries}
-    c_by_key = {_key(e): e for e in c_entries}
-    compared = 0
-    for key in sorted(f_set & c_set):
-        fe, ce = f_by_key[key], c_by_key[key]
-        label = "%s#%s" % key
-        for field in COMPARED_FIELDS:
-            fv, cv = fe.get(field), ce.get(field)
-            if fv != cv:
-                if field == "tensor_sha256":
-                    reasons.append("TENSOR_MISMATCH@%s" % label)
-                elif field == "global_rng_sha256":
-                    reasons.append("GLOBAL_RNG_DIVERGENCE@%s" % label)
-                else:
-                    reasons.append("FIELD_MISMATCH:%s@%s" % (field, label))
-        compared += 1
-
-    # ---- intra-log stream integrity -----------------------------------------
-    _intra_log_checks(f_entries, "factual", reasons)
-    _intra_log_checks(c_entries, "counterfactual", reasons)
-
-    status = STRICT_NOISE_COUPLED if not reasons else STRICT_COUPLING_INVALID
-    validate_status(status)
-    return {
-        "status": status,
-        "reasons": reasons,
-        "entries_compared": compared,
-        "sites": sorted(f_sites & c_sites),
-        "continuation": continuation,
-        "restored_branches": restored_branches,
-    }
-
-
-def _invalid(reasons):
-    return {
+def _invalid(reasons, extra=None):
+    res = {
         "status": STRICT_COUPLING_INVALID,
-        "reasons": reasons,
+        "reasons": list(reasons),
         "entries_compared": 0,
         "sites": [],
         "continuation": {"factual": None, "counterfactual": None},
         "restored_branches": [],
+        "diagnostics": [],
+        "grammar_violations": [],
+        "pair_id": None,
+        "run_ids": None,
     }
+    res.update(extra or {})
+    validate_status(res["status"])
+    return res
 
 
-def is_pass(result):
-    return result.get("status") == STRICT_NOISE_COUPLED
+# ------------------------------------------------------------- manifest ------
+def resolve_manifest(manifest):
+    if isinstance(manifest, dict):
+        return dict(manifest)
+    txt = _read_text(manifest) if isinstance(manifest, str) else None
+    try:
+        obj = json.loads(txt)
+    except Exception:
+        raise ValueError("pair manifest is neither a dict nor JSON/path: %r"
+                         % (manifest,))
+    if not isinstance(obj, dict):
+        raise ValueError("pair manifest must decode to an object")
+    return obj
+
+
+def check_manifest(m):
+    missing = [k for k in MANIFEST_REQUIRED_FIELDS if k not in m]
+    if missing:
+        return ["PAIR_MANIFEST_INCOMPLETE: missing %s" % ",".join(missing)]
+    if m["schema"] != MANIFEST_SCHEMA:
+        return ["PAIR_MANIFEST_SCHEMA:%r != %r" % (m["schema"], MANIFEST_SCHEMA)]
+    run_ids = m["run_ids"]
+    if not isinstance(run_ids, dict) or \
+            any(r not in run_ids for r in ("factual", "counterfactual")):
+        return ["PAIR_MANIFEST_RUN_IDS: need entries for factual+counterfactual"]
+    if run_ids["factual"] == run_ids["counterfactual"]:
+        return ["RUN_ID_COLLISION: manifest declares identical run_ids"]
+    try:
+        int(m["fork_chunk"])
+    except Exception:
+        return ["PAIR_MANIFEST_FORK_CHUNK: not an int"]
+    return []
+
+
+def file_sha256(path):
+    hh = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            hh.update(chunk)
+    return hh.hexdigest()
+
+
+def _artifact_sha(spec):
+    path = spec.get("path")
+    h = spec.get("sha256")
+    if path and h is None:
+        h = file_sha256(path)
+    return path, h
+
+
+# ------------------------------------------------------------- main entry ----
+def validate_pair(factual_log, cf_log, pair_manifest,
+                  factual_role="factual", cf_role="counterfactual"):
+    reasons = []
+    # -- roles ---------------------------------------------------------------
+    if factual_role == cf_role:
+        return _invalid(["ROLES_NOT_DISTINCT:%r" % factual_role])
+    try:
+        m = resolve_manifest(pair_manifest)
+    except ValueError as exc:
+        return _invalid(["PAIR_MANIFEST_REQUIRED:%s" % exc])
+    mreasons = check_manifest(m)
+    if mreasons:
+        return _invalid(mreasons)
+    fork_chunk = int(m["fork_chunk"])
+
+    # -- self-pair guard -----------------------------------------------------
+    same_source = False
+    if isinstance(factual_log, str) and isinstance(cf_log, str):
+        fa = os.path.abspath(factual_log) if os.path.exists(factual_log) else None
+        ca = os.path.abspath(cf_log) if os.path.exists(cf_log) else None
+        if fa and ca:
+            same_source = (fa == ca)
+    try:
+        F = load_log(factual_log)
+        C = load_log(cf_log)
+    except ValueError as exc:
+        return _invalid(["LEDGER_PARSE_ERROR:%s" % exc])
+    if same_source or F["text"] == C["text"]:
+        return _invalid(["SELF_PAIR:factual and counterfactual logs are "
+                         "identical sources"])
+
+    # -- artifact binding ------------------------------------------------------
+    for role_key, parsed in ((factual_role, F), (cf_role, C)):
+        art = (m.get("artifacts") or {}).get("%s_log" % role_key)
+        if art:
+            _p, want = _artifact_sha(art)
+            got = hashlib.sha256(parsed["text"].encode("utf-8")).hexdigest()
+            if want and want != got:
+                reasons.append("ARTIFACT_HASH_MISMATCH:%s_log" % role_key)
+
+    # -- meta headers ----------------------------------------------------------
+    out = {}
+    for role, parsed in ((factual_role, F), (cf_role, C)):
+        if len(parsed["metas"]) == 0:
+            reasons.append("MISSING_META_HEADER:%s" % role)
+        elif len(parsed["metas"]) > 1:
+            reasons.append("MULTI_META_HEADER:%s count=%d" % (role, len(parsed["metas"])))
+        else:
+            meta = parsed["metas"][0]
+            out[role] = meta
+            if meta.get("branch_id") != role:
+                reasons.append("ROLE_LABEL_MISMATCH:%s branch_id=%r"
+                               % (role, meta.get("branch_id")))
+    fm, cm = out.get(factual_role), out.get(cf_role)
+    if fm is None or cm is None:
+        return _invalid(reasons)
+
+    # -- run_ids / pair binding ----------------------------------------------
+    f_run, c_run = fm.get("run_id"), cm.get("run_id")
+    if f_run is None or c_run is None:
+        reasons.append("RUN_ID_MISSING:both ledgers must carry run_id in meta")
+    if m["run_ids"].get(factual_role) != f_run:
+        reasons.append("RUN_ID_MANIFEST_MISMATCH:%s meta=%r manifest=%r"
+                       % (factual_role, f_run, m["run_ids"].get(factual_role)))
+    if m["run_ids"].get(cf_role) != c_run:
+        reasons.append("RUN_ID_MANIFEST_MISMATCH:%s meta=%r manifest=%r"
+                       % (cf_role, c_run, m["run_ids"].get(cf_role)))
+    if f_run is not None and f_run == c_run:
+        reasons.append("RUN_ID_COLLISION:same run_id in both ledgers (%r)" % f_run)
+
+    # -- append-mixing detection ---------------------------------------------
+    for role, parsed in ((factual_role, F), (cf_role, C)):
+        rid = fm.get("run_id") if role == factual_role else cm.get("run_id")
+        pid = m["pair_id"]
+        seen_keys = set()
+        seq_prev = -1
+        lines = ([parsed["metas"][0]] + parsed["entries"] + parsed["events"]) \
+            if len(parsed["metas"]) == 1 else []
+        for ln in lines:
+            if ln.get("run_id") is not None and ln.get("run_id") != rid:
+                reasons.append("LEDGER_APPEND_MIX:%s line run_id=%r != header %r"
+                               % (role, ln.get("run_id"), rid))
+            if ln.get("pair_id") is not None and ln.get("pair_id") != pid:
+                reasons.append("PAIR_ID_MISMATCH:%s line pair_id=%r != manifest %r"
+                               % (role, ln.get("pair_id"), pid))
+            if ln.get("event") == "draw":
+                kk = _key(ln)
+                if kk in seen_keys:
+                    reasons.append("APPEND_MIX_DUPLICATE:%s %s#%s@chunk%s"
+                                   % ((role,) + kk))
+                seen_keys.add(kk)
+                sv = ln.get("seq", 0)
+                if isinstance(sv, int):
+                    if sv <= seq_prev:
+                        reasons.append("SEQ_REGRESSION:%s at seq=%r after %d"
+                                       % (role, sv, seq_prev))
+                    seq_prev = sv
+
+    # -- meta comparison (across branches AND against the manifest) -----------
+    META_CHECKS = (
+        ("pin", "upstream_pin"), ("patch_sha256", "patch_sha256"),
+        ("profile_sha256", "profile_sha256"),
+        ("common_config_sha256", "common_config_sha256"),
+    )
+    for meta_field, man_field in META_CHECKS:
+        fv, cv = fm.get(meta_field), cm.get(meta_field)
+        mv = m.get(man_field)
+        if mv is not None:
+            if fv != mv:
+                reasons.append("META_MISMATCH:%s factual=%r manifest=%r"
+                               % (meta_field, fv, mv))
+            if cv != mv:
+                reasons.append("META_MISMATCH:%s counterfactual=%r manifest=%r"
+                               % (meta_field, cv, mv))
+        elif fv != cv:
+            reasons.append("META_MISMATCH:%s across branches" % meta_field)
+    if int(fm.get("fork_chunk", -10 ** 9)) != fork_chunk or \
+       int(cm.get("fork_chunk", -10 ** 9)) != fork_chunk:
+        reasons.append("META_MISMATCH:fork_chunk factual=%r cf=%r manifest=%d"
+                       % (fm.get("fork_chunk"), cm.get("fork_chunk"), fork_chunk))
+    for soft in ("torch", "diffusers"):
+        fv, cv = fm.get(soft), cm.get(soft)
+        if fv != cv:
+            if soft == "diffusers" and "UNDECLARED" in (fv, cv):
+                continue  # graceful when diffusers absent locally/emitter-side
+            reasons.append("META_MISMATCH:%s across branches" % soft)
+    fw, cw = fm.get("warp_seed") or {}, cm.get("warp_seed") or {}
+    if fw != cw:
+        reasons.append("META_MISMATCH:warp_seed factual=%r cf=%r" % (fw, cw))
+    if fw.get("present") is not True:
+        reasons.append("PRECOND1_GLOBAL_RNG_BYPASS:meta warp_seed absent")
+    mw = m.get("warp_seed_sha256")
+    if mw and fw.get("sha256") != mw:
+        reasons.append("META_MISMATCH:warp_seed_sha vs manifest")
+
+    # -- events at the fork boundary ------------------------------------------
+    f_cap = [e for e in F["events"]
+             if e.get("event") == "FORK_CAPTURE" and e.get("chunk") == fork_chunk]
+    c_res = [e for e in C["events"]
+             if e.get("event") == GENERATOR_STATE_RESTORED and e.get("chunk") == fork_chunk]
+    if not f_cap:
+        reasons.append("MISSING_EVENT:FORK_CAPTURE@%d (%s)" % (fork_chunk, factual_role))
+    if not c_res:
+        reasons.append("MISSING_EVENT:GENERATOR_STATE_RESTORED@%d (%s)"
+                       % (fork_chunk, cf_role))
+    restored_branches = []
+    if c_res:
+        restored_branches.append(cf_role)
+        first_post = min((e.get("seq", 1 << 60) for e in C["entries"]
+                          if isinstance(e.get("chunk"), int) and e["chunk"] >= fork_chunk),
+                         default=None)
+        res_seq = min(e.get("seq", 1 << 60) for e in c_res)
+        if first_post is not None and res_seq > first_post:
+            reasons.append("RESTORE_AFTER_POSTFORK_DRAW:restore seq=%s > first "
+                           "post-fork draw seq=%s" % (res_seq, first_post))
+        if cm.get("continuation") != GENERATOR_STATE_RESTORED:
+            reasons.append("RESTORE_METADATA_MISMATCH:restore event present but "
+                           "meta.continuation=%r" % cm.get("continuation"))
+    elif len(C["metas"]) == 1 and cm.get("continuation") == GENERATOR_STATE_RESTORED:
+        # lazy-continuation bug (v1): claim without a real restore event
+        reasons.append("RESTORE_METADATA_MISMATCH:meta claims %s without a "
+                       "GENERATOR_STATE_RESTORED event" % GENERATOR_STATE_RESTORED)
+    if f_cap and fm.get("continuation") is not None:
+        reasons.append("RESTORE_METADATA_MISMATCH:factual parent must not claim "
+                       "continuation=%r" % fm.get("continuation"))
+
+    # -- coverage / alignment ---------------------------------------------------
+    def build_map(entries, role_label):
+        d = {}
+        for e in entries:
+            kk = _key(e)
+            if kk in d:
+                reasons.append("APPEND_MIX_DUPLICATE:%s %s#%s@chunk%s"
+                               % ((role_label,) + kk))
+            d[kk] = e
+        return d
+
+    fd = build_map(F["entries"], factual_role)
+    cd = build_map(C["entries"], cf_role)
+    f_sites = {kk[0] for kk in fd}
+    c_sites = {kk[0] for kk in cd}
+    for site in REQUIRED_SITES:
+        if site not in f_sites:
+            reasons.append("MISSING_SITE:%s (%s)" % (site, factual_role))
+        if site not in c_sites:
+            reasons.append("MISSING_SITE:%s (%s)" % (site, cf_role))
+    for site in sorted((f_sites | c_sites) - set(REQUIRED_SITES)):
+        reasons.append("UNEXPECTED_SITE:%s" % site)
+    for key in sorted(set(fd) - set(cd)):
+        reasons.append("MISSING_SITE:%s#%s@chunk%s (%s)" % (key + (cf_role,)))
+    for key in sorted(set(cd) - set(fd)):
+        reasons.append("MISSING_SITE:%s#%s@chunk%s (%s)" % (key + (factual_role,)))
+
+    # -- grammar -----------------------------------------------------------------
+    import sc1_grammar
+    grammar_violations = []
+    for role, parsed in ((factual_role, F), (cf_role, C)):
+        gres, _n = sc1_grammar.validate_ledger(parsed["entries"], fork_chunk)
+        grammar_violations.extend(gres)
+    reasons.extend(grammar_violations)
+
+    # -- aligned comparisons ------------------------------------------------------
+    compared = 0
+    diagnostics = []
+    for key in sorted(set(fd) & set(cd)):
+        fe, ce = fd[key], cd[key]
+        label = "%s#%s@chunk%s" % key
+        site = key[0]
+        chunk = key[2] if isinstance(key[2], int) else -1
+        pre_divergence = chunk <= fork_chunk
+        for field in COMPARED_FIELDS:
+            if fe.get(field) != ce.get(field):
+                reasons.append("FIELD_MISMATCH:%s@%s" % (field, label))
+        if site in EXACT_TENSOR_SITES:
+            if fe.get("tensor_sha256") != ce.get("tensor_sha256"):
+                reasons.append("TENSOR_MISMATCH@%s" % label)
+            if fe.get("generator_state_hash_before") != ce.get("generator_state_hash_before"):
+                reasons.append("FIELD_MISMATCH:generator_state_hash_before@%s" % label)
+            if fe.get("generator_state_hash_after") != ce.get("generator_state_hash_after"):
+                reasons.append("FIELD_MISMATCH:generator_state_hash_after@%s" % label)
+        elif site in STREAM_WITNESS_SITES:
+            for fld in STREAM_ENTRY_FIELDS:
+                if fe.get(fld) != ce.get(fld):
+                    reasons.append("FIELD_MISMATCH:%s@%s" % (fld, label))
+            fx = fe.get("extra") or {}
+            cx = ce.get("extra") or {}
+            for dfld in R2_R3_DIAG_FIELDS:
+                fv2, cv2 = fx.get(dfld), cx.get(dfld)
+                if fv2 is None or cv2 is None:
+                    if pre_divergence:
+                        reasons.append("DIAGNOSTIC_MISSING:%s@%s" % (dfld, label))
+                    continue
+                if fv2 == cv2:
+                    continue
+                if pre_divergence:
+                    reasons.append("DIAGNOSTIC_MISMATCH:%s@%s (byte-equality "
+                                   "required at chunk<=fork_chunk)"
+                                   % (dfld, label))
+                else:
+                    diagnostics.append({
+                        "kind": "R2R3_DIAGNOSTIC_DIVERGENCE", "field": dfld,
+                        "where": label,
+                        "factual": fv2, "counterfactual": cv2,
+                        "note": "recorded only; exogenous coupling unaffected",
+                    })
+            # tensor equality intentionally NOT compared here (adjudicated)
+        compared += 1
+
+    # -- intra-log stream integrity (main sites) ----------------------------------
+    for role, parsed in ((factual_role, F), (cf_role, C)):
+        ordered = sorted(parsed["entries"], key=lambda e: e.get("seq", 0))
+        last_main_after = None
+        for e in ordered:
+            site = e.get("site_id")
+            kk = "%s#%s" % (site, e.get("ordinal"))
+            if site in ISOLATED_SITES:
+                if e.get("generator_role") != "isolated_warp":
+                    reasons.append("PRECOND1_GLOBAL_RNG_BYPASS@%s role=%r"
+                                   % (kk, e.get("generator_role")))
+                continue
+            before = e.get("generator_state_hash_before")
+            after = e.get("generator_state_hash_after")
+            if before is None or after is None:
+                reasons.append("FIELD_MISMATCH:none@%s (%s)" % (kk, role))
+            else:
+                if before == after:
+                    reasons.append("NOOP_DRAW_BYPASS:%s [%s]" % (kk, role))
+                if last_main_after is not None and before != last_main_after:
+                    reasons.append("STREAM_CHAIN_BREAK:%s [%s]" % (kk, role))
+                last_main_after = after
+            if after is not None:
+                last_main_after = after
+
+    # -- R7 cross-branch isolated-stream witness ----------------------------------
+    r7_diags, r7_bad = _r7_cross_branch(fd, cd)
+    diagnostics.extend(r7_diags)
+    reasons.extend(r7_bad)
+
+    # -- FORK_STATE_DIGEST artifacts ------------------------------------------------
+    loaded_digests = {}
+    for side, spec_name in (("parent", "parent_state_digest"),
+                            ("child", "child_state_digest")):
+        spec = m[spec_name]
+        try:
+            path, want = _artifact_sha(spec) if isinstance(spec, dict) else (None, None)
+            if path is None:
+                reasons.append("STATE_DIGEST_LOAD_ERROR:%s (%s): no path"
+                               % (side, spec_name))
+                continue
+            if want:
+                if file_sha256(path) != want:
+                    reasons.append("ARTIFACT_HASH_MISMATCH:%s" % spec_name)
+            import fork_state_digest as fsd
+            man = fsd.load(path)
+            loaded_digests[side] = man
+            if man.get("missing_required_paths"):
+                reasons.append("STATE_DIGEST_MISSING_REQUIRED:%s %s"
+                               % (side, man["missing_required_paths"]))
+        except Exception as exc:
+            reasons.append("STATE_DIGEST_LOAD_ERROR:%s (%s): %s"
+                           % (side, spec_name, exc))
+    if len(loaded_digests) == 2:
+        import fork_state_digest as fsd
+        rep = fsd.compare(loaded_digests["parent"], loaded_digests["child"])
+        for mm in rep["mismatches"]:
+            reasons.append("FORK_STATE_DIGEST_MISMATCH:%s reason=%s"
+                           % (mm.get("field"), mm.get("reason")))
+        for ms in rep["missing"]:
+            reasons.append("FORK_STATE_DIGEST_MISSING:%s %s"
+                           % (ms.get("field"), ms.get("path", "")))
+
+    status = STRICT_NOISE_COUPLED if not reasons else STRICT_COUPLING_INVALID
+    result = {
+        "status": status,
+        "reasons": reasons,
+        "entries_compared": compared,
+        "sites": sorted(f_sites & c_sites),
+        "continuation": {
+            factual_role: GENERATOR_STATE_RESTORED if f_cap else None,
+            cf_role: GENERATOR_STATE_RESTORED if c_res else None,
+        },
+        "restored_branches": restored_branches,
+        "diagnostics": diagnostics,
+        "grammar_violations": grammar_violations,
+        "pair_id": m.get("pair_id"),
+        "run_ids": {"factual": f_run, "counterfactual": c_run},
+    }
+    validate_status(status)
+    return result
+
+
+def _r7_cross_branch(fd, cd):
+    """Walk R7 rows in parallel; chain equality holds until the first EXPLAINED
+    domain divergence (high/skip difference). Index tensors NEVER compared."""
+    diags, bad = [], []
+    f_rows = {kk: v for kk, v in fd.items() if kk[0] == "R7"}
+    c_rows = {kk: v for kk, v in cd.items() if kk[0] == "R7"}
+    diverged = False
+    for key in sorted(set(f_rows) | set(c_rows)):
+        fe, ce = f_rows.get(key), c_rows.get(key)
+        label = "R7#%s@chunk%s" % (key[1], key[2])
+        if fe is None or ce is None:
+            continue  # already reported as MISSING_SITE
+        fex, cex = fe.get("extra") or {}, ce.get("extra") or {}
+        fhigh, chigh = fex.get("high"), cex.get("high")
+        fskip, cskip = bool(fex.get("skip_flag")), bool(cex.get("skip_flag"))
+        if not diverged:
+            domain_equal = (fhigh == chigh) and (fskip == cskip)
+            if not domain_equal:
+                diverged = True
+                diags.append({
+                    "kind": "R7_EXPLAINED_DOMAIN_DIVERGENCE", "where": label,
+                    "high_factual": fhigh, "high_counterfactual": chigh,
+                    "skip_factual": fskip, "skip_counterfactual": cskip,
+                    "note": "index inequality ignored by ruling; state "
+                            "differences after this point are tolerated",
+                })
+                continue
+            for fld in STREAM_ENTRY_FIELDS:
+                if fe.get(fld) != ce.get(fld):
+                    bad.append("R7_STATE_DIVERGENCE_UNEXPLAINED:%s %s "
+                               "(domains still equal)" % (label, fld))
+        else:
+            diags.append({
+                "kind": "R7_POST_DIVERGENCE_ROW", "where": label,
+                "note": "tolerated after explained divergence; index ignored",
+            })
+    return diags, bad
+
+
+def compare_coupling_logs(factual_log, cf_log, pair_manifest=None,
+                          factual_role="factual", cf_role="counterfactual"):
+    """Backward-compatible alias; the pair manifest is now REQUIRED."""
+    return validate_pair(factual_log, cf_log, pair_manifest,
+                         factual_role=factual_role, cf_role=cf_role)
 
 
 def format_result(result):
     lines = ["%s (%d draws compared)" % (result["status"], result["entries_compared"])]
-    if result["restored_branches"]:
+    if result.get("restored_branches"):
         lines.append("continuation: %s -> %s"
-                     % (", ".join(result["restored_branches"]), GENERATOR_STATE_RESTORED))
-    for r in result["reasons"]:
+                     % (", ".join(result["restored_branches"]),
+                        GENERATOR_STATE_RESTORED))
+    for r in result.get("reasons", []):
         lines.append("  - %s" % r)
+    for d in result.get("diagnostics", []):
+        lines.append("  ~ diagnostic %s @ %s" % (d.get("kind"), d.get("where")))
     return "\n".join(lines)
 
 
-if __name__ == "__main__":  # pragma: no cover - tiny CLI convenience
+if __name__ == "__main__":  # pragma: no cover
     import sys
-    if len(sys.argv) != 3:
-        print("usage: python strict_coupling.py FACTUAL.jsonl COUNTERFACTUAL.jsonl")
+    if len(sys.argv) != 4:
+        print("usage: python strict_coupling.py FACTUAL.jsonl CF.jsonl PAIR_MANIFEST.json")
         raise SystemExit(2)
-    res = compare_coupling_logs(sys.argv[1], sys.argv[2])
+    res = validate_pair(sys.argv[1], sys.argv[2], sys.argv[3])
     print(format_result(res))
     raise SystemExit(0 if is_pass(res) else 1)

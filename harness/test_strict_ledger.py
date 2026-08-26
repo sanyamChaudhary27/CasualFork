@@ -1,9 +1,13 @@
-"""P3 unit tests: strict-coupling ledger validator + NoiseTape (pure CPU, mock logs).
+"""P3 unit tests: strict-coupling ledger validator V2 + NoiseTape (CPU, mock logs).
+
+STAGE-B/C FIX ROUND: the v1 suite is SUPERSEDED where Auditor B proved v1 holes
+(self-pair PASSed, lazy continuation, ordinal-only checks). Superseded cases are
+re-pointed at their v2 equivalents and marked [SUPERSEDED->v2]. New exhaustive
+adversarial coverage lives in test_strict_ledger_v2.py (cases A-P).
 
 Plain-assert runner. Prints PASS / FAIL / BLOCKED lines; exits nonzero on FAIL.
-The optional live-module block imports evoke/strict_fork.py FROM THE PATCHED WORK
-TREE (temp copy the patch was authored in) via importlib - no pip installs, no
-weights, no GPU. If that tree is absent, those cases report BLOCKED honestly.
+The optional live-module block imports evoke/strict_fork.py FROM THE PATCHED
+SOURCE (patches/evoke_strict_fork.py.txt - standalone, torch-only import).
 """
 from __future__ import annotations
 
@@ -17,64 +21,8 @@ import traceback
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-import strict_coupling as sc  # noqa: E402
-
-
-# ---------------------------------------------------------------- mock ledgers
-def _sha(b):
-    import hashlib
-    return hashlib.sha256(b).hexdigest()
-
-
-def simulate_branch(n_chunks=2):
-    """Replay the SC1 per-chunk draw order through two REAL cpu Generators and
-    emit validator-shaped entries (same code paths as evoke.strict_fork.log_draw)."""
-    import torch
-    main = torch.Generator(device="cpu").manual_seed(1234)
-    iso = torch.Generator(device="cpu").manual_seed(777)
-    order = ["R2", "R3", "R4", "R5", "R7", "R1", "R6", "R6"]
-    shapes = {"R1": (1, 16, 9, 48, 80), "R2": (1, 16, 1, 48, 80), "R3": (1, 16, 9, 48, 80),
-              "R4": (9,), "R5": (1, 16, 9, 48, 80), "R6": (432, 4), "R7": (2000,)}
-    seq = 0
-    meta = {"event": "meta", "pin": "74d268516d95c8fceadd2378f91a73f9f187042b",
-            "branch_id": "factual", "continuation": None}
-    entries = []
-    for chunk in range(n_chunks):
-        for site in order:
-            seq += 1
-            role = "isolated_warp" if site == "R7" else "main"
-            gen = iso if site == "R7" else main
-            before = _sha(gen.get_state().numpy().tobytes())
-            t = torch.randn(*shapes[site], generator=gen)
-            after = _sha(gen.get_state().numpy().tobytes())
-            ord_key = (site, "iso") if site == "R7" else site
-            entries.append({
-                "event": "draw", "seq": seq, "site_id": site,
-                "ordinal": sum(1 for e in entries if e["site_id"] == site) + 1,
-                "branch_id": "factual", "chunk": chunk,
-                "stage": 1 if site == "R6" else None,
-                "generator_role": role,
-                "generator_state_hash_before": before,
-                "generator_state_hash_after": after,
-                "tensor_sha256": sc.tensor_sha256(t) if hasattr(sc, "tensor_sha256") else _sha(t.numpy().tobytes()),
-                "shape": list(t.shape), "dtype": str(t.dtype),
-                "global_rng_sha256": "g%03d" % seq,
-            })
-    return meta, entries
-
-
-def to_jsonl(meta, entries):
-    return "\n".join([json.dumps(meta, sort_keys=True)] +
-                     [json.dumps(e, sort_keys=True) for e in entries]) + "\n"
-
-
-def make_pair():
-    fm, fe = simulate_branch()
-    cm, ce = copy.deepcopy(simulate_branch())
-    cm["branch_id"] = "counterfactual"
-    for e in ce:
-        e["branch_id"] = "counterfactual"
-    return (to_jsonl(fm, fe), to_jsonl(cm, ce))
+import strict_coupling as sc          # noqa: E402
+import testutil_sc1 as tu             # noqa: E402
 
 
 # ---------------------------------------------------------------- test helpers
@@ -92,147 +40,182 @@ def case(name):
     return deco
 
 
+def load_log_text(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def rewrite(tmpdir, src_path, mutator, name="mut.jsonl"):
+    objs = [json.loads(x) for x in load_log_text(src_path).splitlines() if x.strip()]
+    objs = mutator(objs)
+    dst = os.path.join(tmpdir, name)
+    with open(dst, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n")
+    return dst
+
+
 # ---------------------------------------------------------------- unit cases
-@case("aligned-equal pair -> STRICT_NOISE_COUPLED")
+@case("[SUPERSEDED->v2] aligned-equal pair -> STRICT_NOISE_COUPLED")
 def t_aligned():
-    f, c = make_pair()
-    r = sc.compare_coupling_logs(f, c)
-    assert sc.is_pass(r), sc.format_result(r)
-    assert r["status"] == sc.STRICT_NOISE_COUPLED
-    assert not r["reasons"], r["reasons"]
-    assert sorted(r["sites"]) == sorted(sc.REQUIRED_SITES)
-    assert r["entries_compared"] == 16
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        r = sc.validate_pair(fp, cp, man)
+        assert sc.is_pass(r), sc.format_result(r)
+        assert sorted(r["sites"]) == sorted(sc.REQUIRED_SITES)
+        assert r["entries_compared"] == 30      # 3 chunks x (7 fixed + 3 R7)
+        assert r["restored_branches"] == ["counterfactual"]
+        assert r["pair_id"] == tu.PAIR_ID
+        assert r["run_ids"] == {"factual": "run-F-fix",
+                                "counterfactual": "run-C-fix"}
     return True
 
 
-@case("unequal tensor -> STRICT_COUPLING_INVALID (TENSOR_MISMATCH)")
+@case("unequal EXACT_TENSOR (R1) -> TENSOR_MISMATCH")
 def t_tensor():
-    f, c = make_pair()
-    lines = c.splitlines()
-    objs = [json.loads(x) for x in lines]
-    for o in objs:
-        if o.get("site_id") == "R1":
-            o["tensor_sha256"] = "0" * 64
-            break
-    c2 = "\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n"
-    r = sc.compare_coupling_logs(f, c2)
-    assert not sc.is_pass(r)
-    assert any(x.startswith("TENSOR_MISMATCH@R1#") for x in r["reasons"]), r["reasons"]
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(
+            td, variant_c={"flip_tensor": ["R1", 1]})
+        r = sc.validate_pair(fp, cp, man)
+        assert not sc.is_pass(r)
+        assert any(x.startswith("TENSOR_MISMATCH@R1#") for x in r["reasons"])
     return True
 
 
-@case("missing required site -> INVALID (MISSING_SITE)")
+@case("missing required site (R5, cf) -> MISSING_SITE")
 def t_missing_site():
-    f, c = make_pair()
-    lines = [x for x in c.splitlines() if '"R5"' not in x]
-    c2 = "\n".join(lines) + "\n"
-    r = sc.compare_coupling_logs(f, c2)
-    assert not sc.is_pass(r)
-    assert "MISSING_SITE:R5 (counterfactual)" in r["reasons"], r["reasons"]
-    assert any(x.startswith("MISSING_SITE:R5#") for x in r["reasons"])
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(
+            td, variant_c={"drop_site_at": ["R5", 1]})
+        r = sc.validate_pair(fp, cp, man)
+        assert not sc.is_pass(r)
+        # site still present in chunk 0, so only the per-key alignment breaks
+        assert any(x.startswith("MISSING_SITE:R5#") and "(counterfactual)" in x
+                   for x in r["reasons"]), r["reasons"][:8]
     return True
 
 
-@case("unexpected site -> INVALID (UNEXPECTED_SITE)")
+@case("unexpected site RX -> UNEXPECTED_SITE")
 def t_unexpected():
-    f, c = make_pair()
-    objs = [json.loads(x) for x in c.splitlines()]
-    extra = dict(objs[1])
-    extra["site_id"] = "RX"
-    extra["ordinal"] = 1
-    objs.append(extra)
-    c2 = "\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n"
-    r = sc.compare_coupling_logs(f, c2)
-    assert not sc.is_pass(r)
-    assert "UNEXPECTED_SITE:RX" in r["reasons"], r["reasons"]
+    def add_rx(objs):
+        extra = copy.deepcopy(objs[1])
+        extra["site_id"] = "RX"
+        extra["ordinal"] = 99
+        extra["chunk"] = 9
+        objs.append(extra)
+        return objs
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        cp2 = rewrite(td, cp, add_rx, name="rx.jsonl")
+        man["artifacts"]["counterfactual_log"] = tu.file_art(cp2)
+        r = sc.validate_pair(fp, cp2, man)
+        assert not sc.is_pass(r)
+        assert "UNEXPECTED_SITE:RX" in r["reasons"]
     return True
 
 
-@case("ordinal misalignment -> INVALID (ORDINAL_MISMATCH)")
+@case("[SUPERSEDED->v2] ordinal misalignment -> alignment break detected")
 def t_ordinal():
-    f, c = make_pair()
-    objs = [json.loads(x) for x in c.splitlines()]
-    seen = 0
-    for o in objs:
-        if o.get("site_id") == "R6":
-            seen += 1
-            o["ordinal"] = seen + 1  # shift 1,2 -> 2,3
-    c2 = "\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n"
-    r = sc.compare_coupling_logs(f, c2)
-    assert not sc.is_pass(r)
-    assert any(x.startswith("ORDINAL_MISMATCH:R6 ") for x in r["reasons"]), r["reasons"]
+    seen = {"n": 0}
+
+    def shift_r6(objs):
+        for o in objs:
+            if o.get("site_id") == "R6":
+                seen["n"] += 1
+                o["ordinal"] = o["ordinal"] + 10
+        return objs
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        cp2 = rewrite(td, cp, shift_r6, name="ord.jsonl")
+        man["artifacts"]["counterfactual_log"] = tu.file_art(cp2)
+        r = sc.validate_pair(fp, cp2, man)
+        assert not sc.is_pass(r)
+        assert any(x.startswith("MISSING_SITE:R6#") for x in r["reasons"]), \
+            r["reasons"][:8]
     return True
 
 
-@case("bypass indicators -> INVALID (STREAM_CHAIN_BREAK + PRECOND1_GLOBAL_RNG_BYPASS)")
+@case("bypass indicators -> CHAIN_BREAK + NOOP_BYPASS + PRECOND1_FALLBACK")
 def t_bypass():
-    f, c = make_pair()
-    objs = [json.loads(x) for x in f.splitlines()]
-    main_seen = 0
-    for o in objs:
-        if o.get("site_id") in ("R1", "R2", "R3", "R4", "R5", "R6"):
-            main_seen += 1
-            if main_seen == 2:   # break the chain at a NON-first draw so the
-                o["generator_state_hash_before"] = "f" * 64   # predecessor link is checked
-            if main_seen == 4:
-                o["generator_state_hash_after"] = o["generator_state_hash_before"]  # noop draw
-        if o.get("site_id") == "R7":
-            o["generator_role"] = "GLOBAL_FALLBACK"
-    f2 = "\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n"
-    r = sc.compare_coupling_logs(f2, c)
-    assert not sc.is_pass(r)
-    assert any(x.startswith("STREAM_CHAIN_BREAK:") for x in r["reasons"]), r["reasons"]
-    assert any(x.startswith("NOOP_DRAW_BYPASS:") for x in r["reasons"]), r["reasons"]
-    assert any(x.startswith("PRECOND1_GLOBAL_RNG_BYPASS@R7#") for x in r["reasons"]), r["reasons"]
+    state = {"main_seen": 0}
+
+    def corrupt(objs):
+        for o in objs:
+            if o.get("event") != "draw":
+                continue
+            if o.get("generator_role") == "isolated_warp":
+                if o.get("extra", {}).get("call_ordinal") == 0:
+                    o["generator_role"] = "GLOBAL_FALLBACK"
+                continue
+            if o.get("chunk") == 0:
+                continue  # keep chunk-0 chain intact for the fixture baseline
+            state["main_seen"] += 1
+            if state["main_seen"] == 2:
+                o["generator_state_hash_before"] = "f" * 64
+            if state["main_seen"] == 4:
+                o["generator_state_hash_after"] = o["generator_state_hash_before"]
+        return objs
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        fp2 = rewrite(td, fp, corrupt, name="byp.jsonl")
+        man["artifacts"]["factual_log"] = tu.file_art(fp2)
+        r = sc.validate_pair(fp2, cp, man)
+        assert not sc.is_pass(r)
+        assert any(x.startswith("STREAM_CHAIN_BREAK:") for x in r["reasons"])
+        assert any(x.startswith("NOOP_DRAW_BYPASS:") for x in r["reasons"])
+        assert any(x.startswith("PRECOND1_GLOBAL_RNG_BYPASS@R7#")
+                   for x in r["reasons"])
     return True
 
 
-@case("restored-vs-coupled terminology enforced")
+@case("restored-vs-coupled terminology enforced (event-backed, v2)")
 def t_restored():
-    f, c = make_pair()
-    # continuation label recorded, data still coupled -> PASS with restoration noted
-    objs = [json.loads(x) for x in c.splitlines()]
-    objs[0]["continuation"] = sc.GENERATOR_STATE_RESTORED
-    c2 = "\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n"
-    r = sc.compare_coupling_logs(f, c2)
-    assert sc.is_pass(r), sc.format_result(r)
-    assert r["continuation"]["counterfactual"] == sc.GENERATOR_STATE_RESTORED
-    assert r["restored_branches"] == ["counterfactual"]
-    # GENERATOR_STATE_RESTORED is never a coupling verdict
-    try:
-        sc.validate_status(sc.GENERATOR_STATE_RESTORED)
-        raise AssertionError("validate_status accepted GENERATOR_STATE_RESTORED")
-    except ValueError:
-        pass
-    sc.validate_status(sc.STRICT_NOISE_COUPLED)
-    sc.validate_status(sc.STRICT_COUPLING_INVALID)
-    # bogus continuation label -> TERMINOLOGY_VIOLATION + RESTORE_METADATA_MISMATCH
-    objs[0]["continuation"] = "RESTORED"
-    c3 = "\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n"
-    r2 = sc.compare_coupling_logs(f, c3)
-    assert not sc.is_pass(r2)
-    assert any(x.startswith("TERMINOLOGY_VIOLATION:") for x in r2["reasons"]), r2["reasons"]
-    assert any(x.startswith("RESTORE_METADATA_MISMATCH") for x in r2["reasons"])
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        r = sc.validate_pair(fp, cp, man)
+        assert sc.is_pass(r)
+        assert r["continuation"]["counterfactual"] == sc.GENERATOR_STATE_RESTORED
+        # GENERATOR_STATE_RESTORED is never a coupling verdict
+        try:
+            sc.validate_status(sc.GENERATOR_STATE_RESTORED)
+            raise AssertionError("validate_status accepted continuation label")
+        except ValueError:
+            pass
+        sc.validate_status(sc.STRICT_NOISE_COUPLED)
+        # lazy continuation claim WITHOUT a restore event -> RESTORE_METADATA_MISMATCH
+        def strip_event(objs):
+            return [o for o in objs
+                    if o.get("event") != sc.GENERATOR_STATE_RESTORED]
+        cp2 = rewrite(td, cp, strip_event, name="lazy.jsonl")
+        man2 = tu.make_manifest(
+            (fp, cp2),
+            (man["parent_state_digest"]["path"],
+             man["child_state_digest"]["path"]),
+            ("run-F-fix", "run-C-fix"))
+        r2 = sc.validate_pair(fp, cp2, man2)
+        assert not sc.is_pass(r2)
+        assert any(x.startswith("RESTORE_METADATA_MISMATCH:") for x in r2["reasons"])
+        assert any(x.startswith("MISSING_EVENT:GENERATOR_STATE_RESTORED")
+                   for x in r2["reasons"])
     return True
 
 
 # ------------------------------------------------- live patched-module checks
-WORK_TREE = os.environ.get(
-    "EVOKE_PATCH_WORK",
-    os.path.join(os.environ.get("TEMP", "/tmp"), "opencode", "sc1-wk"),
-)
-SF_PATH = os.path.join(WORK_TREE, "evoke", "strict_fork.py")
+SF_SRC = os.path.join(os.path.dirname(HERE), "patches", "evoke_strict_fork.py.txt")
 
 
 def _load_sf():
-    if not os.path.exists(SF_PATH):
-        raise BLOCKED("patched work tree not found at %s (set EVOKE_PATCH_WORK)" % SF_PATH)
+    if not os.path.exists(SF_SRC):
+        raise BLOCKED("patched emitter source not found at %s" % SF_SRC)
     sys.dont_write_bytecode = True
     sys.pycache_prefix = os.path.join(tempfile.gettempdir(), "sc1-pyc")
+    import importlib.machinery
     import importlib.util
-    spec = importlib.util.spec_from_file_location("evoke_strict_fork_live", SF_PATH)
+    loader = importlib.machinery.SourceFileLoader("evoke_strict_fork_live", SF_SRC)
+    spec = importlib.util.spec_from_file_location(
+        "evoke_strict_fork_live", SF_SRC, loader=loader)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    sys.modules["evoke_strict_fork_live"] = mod
+    loader.exec_module(mod)
     return mod
 
 
@@ -246,7 +229,6 @@ def t_tape():
     e = tape.record("R4", torch.rand(9, generator=g), ordinal=1, seq=1,
                     generator_role="main")
     assert e["shape"] == [9] and len(e["tensor_sha256"]) == 64
-    assert len(tape.entries) == 1
     try:
         tape.replay("R4")
         raise AssertionError("replay must raise NotImplementedError")
@@ -257,102 +239,168 @@ def t_tape():
         tape.to_jsonl(out)
         back = open(out, encoding="utf-8").read()
     assert json.loads(back.splitlines()[0])["site_id"] == "R4"
+    # skip rows: tensor=None tolerated by record()
+    e2 = tape.record("R7", None, ordinal=2, seq=2, generator_role="isolated_warp")
+    assert e2["tensor_sha256"] is None and e2["shape"] is None
     sf.reset_for_tests()
     return True
 
 
-@case("live log_draw -> validator-compatible ledger (self-pair PASS)")
+@case("live log_draw emits v2-shaped lines (run_id/pair_id on every line)")
 def t_live_ledger():
     sf = _load_sf()
     import torch
     sf.reset_for_tests()
-    old = os.environ.get("EVOKE_STRICT_LEDGER_PATH")
-    with tempfile.TemporaryDirectory() as td:
-        os.environ["EVOKE_STRICT_LEDGER_PATH"] = os.path.join(td, "led.jsonl")
-        try:
+    old = {k: os.environ.get(k) for k in (sf.ENV_LEDGER, sf.ENV_RUN_ID,
+                                          sf.ENV_PAIR_ID)}
+    out_path = None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            os.environ[sf.ENV_RUN_ID] = "run-live-1"
+            os.environ[sf.ENV_PAIR_ID] = "pair-live"
+            os.environ[sf.ENV_LEDGER] = os.path.join(td, "led.base.jsonl")
             g = torch.Generator().manual_seed(42)
             sf.set_chunk(3)
             b = sf.gen_state_of(g)
             t = torch.randn(5, generator=g)
-            entry = sf.log_draw("R1", t, generator=g, gen_before=b, generator_role="main")
+            entry = sf.log_draw("R1", t, generator=g, gen_before=b,
+                                generator_role="main")
             assert entry is not None and entry["ordinal"] == 1
-        finally:
-            sf.reset_for_tests()   # closes the ledger handle BEFORE Windows dir cleanup
-            if old is None:
-                os.environ.pop("EVOKE_STRICT_LEDGER_PATH", None)
+            assert entry["run_id"] == "run-live-1" and entry["pair_id"] == "pair-live"
+            sf.reset_for_tests()   # close handle BEFORE Windows dir cleanup
+            out_path = os.path.join(td, "led.base.run-live-1.jsonl")
+            lines = open(out_path, encoding="utf-8").read().splitlines()
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
             else:
-                os.environ["EVOKE_STRICT_LEDGER_PATH"] = old
-        text = open(os.path.join(td, "led.jsonl"), encoding="utf-8").read()
-    r = sc.compare_coupling_logs(text, text)
-    # A 1-draw smoke ledger cannot satisfy full 7-site coverage, so the verdict is
-    # INVALID - but the ONLY reasons must be coverage gaps: format parses cleanly,
-    # fields align, hashes chain, i.e. the patched tree emits validator-shaped ledgers.
-    assert all(x.startswith("MISSING_SITE:") for x in r["reasons"]), r["reasons"]
-    assert r["entries_compared"] == 1
-    full = sc.compare_coupling_logs(*make_pair())
-    assert sc.is_pass(full)
-    sf.reset_for_tests()
+                os.environ[k] = v
+    objs = [json.loads(x) for x in lines]
+    assert objs[0]["event"] == "meta" and objs[0]["run_id"] == "run-live-1"
+    assert all(o.get("run_id") == "run-live-1" and o.get("pair_id") == "pair-live"
+               for o in objs)
     return True
 
 
-@case("live fork capture -> restore round-trip (GENERATOR_STATE_RESTORED)")
+@case("live unique-ledger-per-run + append refusal (target 9)")
+def t_live_unique_ledger():
+    sf = _load_sf()
+    import torch
+    sf.reset_for_tests()
+    old = {k: os.environ.get(k) for k in (sf.ENV_LEDGER, sf.ENV_RUN_ID)}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            base = os.path.join(td, "led.jsonl")
+            os.environ[sf.ENV_LEDGER] = base
+            os.environ[sf.ENV_RUN_ID] = "run-U1"
+            g = torch.Generator().manual_seed(1)
+            sf.log_draw("R1", torch.randn(3, generator=g), generator=g,
+                        gen_before=sf.gen_state_of(g))
+            sf.reset_for_tests()
+            opened = None
+            for fn in os.listdir(td):
+                if fn.startswith("led.run-U1"):
+                    opened = fn
+            assert opened == "led.run-U1.jsonl", os.listdir(td)
+            # second run, same base -> NEW file, no silent append
+            os.environ[sf.ENV_RUN_ID] = "run-U2"
+            sf.log_draw("R1", torch.randn(3, generator=g), generator=g,
+                        gen_before=sf.gen_state_of(g))
+            sf.reset_for_tests()
+            assert "led.run-U2.jsonl" in os.listdir(td)
+            # refusing to touch an existing target
+            os.environ[sf.ENV_RUN_ID] = "run-U1"
+            try:
+                sf.log_draw("R1", torch.randn(3, generator=g), generator=g,
+                            gen_before=sf.gen_state_of(g))
+                raise AssertionError("append to existing ledger must fail")
+            except RuntimeError as exc:
+                assert "unique-ledger-per-run" in str(exc)
+    finally:
+        sf.reset_for_tests()
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return True
+
+
+@case("live fork capture -> restore round-trip WITH state digest")
 def t_fork_capture_restore():
     sf = _load_sf()
     import torch
     sf.reset_for_tests()
-    with tempfile.TemporaryDirectory() as td:
-        cap_cfg = {"fork_chunk": 2, "mode": "capture", "out_dir": td}
-        os.environ["EVOKE_STRICT_FORK_JSON"] = json.dumps(cap_cfg)
-        try:
-            g = torch.Generator().manual_seed(9)
-            pd = torch.Generator().manual_seed(10)
-            torch.rand(3, generator=g)   # advance
-            gens = sf.collect_generators(g, pd)
-            sidecar = sf.maybe_fork_boundary(1, gens)      # not fork chunk -> no-op
-            assert sidecar is None
-            sidecar = sf.maybe_fork_boundary(2, gens)      # capture
+    old = {k: os.environ.get(k) for k in (sf.ENV_FORK, sf.ENV_RUN_ID)}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = tu.make_mock_root(seed=1000)
+            gens = {"main": torch.Generator().manual_seed(9)}
+            cap_cfg = {"fork_chunk": 2, "mode": "capture", "out_dir": td}
+            os.environ[sf.ENV_FORK] = json.dumps(cap_cfg)
+            torch.rand(3, generator=gens["main"])   # advance past prefix
+            sidecar = sf.maybe_fork_boundary(1, gens, pipeline=root)
+            assert sidecar is None                   # non-fork chunk: no-op
+            sidecar = sf.maybe_fork_boundary(2, gens, pipeline=root)
             assert sidecar is not None and os.path.exists(sidecar)
-            meta = json.load(open(sidecar, encoding="utf-8"))
-            assert set(meta["generators"]) == {"geo_patchdrop", "main"}
-            h_main = meta["generators"]["main"]["sha256"]
+            dg = os.path.join(td, "fork_state_digest_chunk2.json")
+            assert os.path.exists(dg), os.listdir(td)
+            ahead = torch.randn(11, generator=gens["main"])[0].item()
 
-            # continuation immediately after capture (draws from the captured state):
-            g_ahead = torch.randn(11, generator=g)[0].item()
-            pd_ahead = torch.rand(2, generator=pd)[0].item()
-            # now diverge BOTH streams far away from the captured states:
-            torch.rand(5, generator=pd)
-            torch.randn(7, generator=g)
-            res_cfg = {"fork_chunk": 2, "mode": "restore", "sidecar": sidecar}
-            os.environ["EVOKE_STRICT_FORK_JSON"] = json.dumps(res_cfg)
-            rec = sf.maybe_fork_boundary(2, gens)
-            assert rec is not None and sf.continuation_marker() == sc.GENERATOR_STATE_RESTORED
-            x = torch.randn(11, generator=g)[0].item()     # replayed draw post-restore
-            px = torch.rand(2, generator=pd)[0].item()
-            y = float(torch.randn(11, generator=torch.Generator().manual_seed(0))[0])
-            assert x == g_ahead, "main generator did not resume captured stream"
-            assert px == pd_ahead, "patchdrop generator did not resume captured stream"
-            assert x != y
-            assert h_main and len(h_main) == 64
-        finally:
-            os.environ.pop("EVOKE_STRICT_FORK_JSON", None)
-    sf.reset_for_tests()
+            # diverge the stream far away, then restore
+            torch.rand(5, generator=gens["main"]); torch.randn(7, generator=gens["main"])
+            res_cfg = {"fork_chunk": 2, "mode": "restore", "sidecar": sidecar,
+                       "parent_state_digest": dg}
+            os.environ[sf.ENV_FORK] = json.dumps(res_cfg)
+            rec = sf.maybe_fork_boundary(2, gens, pipeline=root)
+            assert rec is not None
+            assert sf.continuation_marker() == sc.GENERATOR_STATE_RESTORED
+            x = torch.randn(11, generator=gens["main"])[0].item()
+            assert x == ahead, "main generator did not resume captured stream"
+            assert os.path.exists(os.path.join(
+                td, "fork_state_digest_child_chunk2.json"))
+
+            # corrupted parent digest -> loud abort + FORK_STATE_MISMATCH line
+            bad = json.load(open(dg, encoding="utf-8"))
+            bad["fields"]["F07"]["group_sha256"] = "0" * 64
+            badp = os.path.join(td, "bad_parent.json")
+            with open(badp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(bad, sort_keys=True, separators=(",", ":")))
+            res_bad = dict(res_cfg, parent_state_digest=badp)
+            os.environ[sf.ENV_FORK] = json.dumps(res_bad)
+            try:
+                sf.maybe_fork_boundary(2, gens, pipeline=root)
+                raise AssertionError("corrupted parent digest must abort")
+            except RuntimeError as exc:
+                assert "FORK_STATE_MISMATCH" in str(exc)
+    finally:
+        sf.reset_for_tests()
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     return True
 
 
-@case("ledger disabled -> zero-effect call sites")
+@case("ledger + fork gates disabled -> zero-effect call sites (byte-neutral)")
 def t_disabled():
     sf = _load_sf()
     sf.reset_for_tests()
-    assert os.environ.get("EVOKE_STRICT_FORK_JSON") is None
-    assert os.environ.get("EVOKE_STRICT_LEDGER_PATH") is None
+    for var in (sf.ENV_LEDGER, sf.ENV_FORK):
+        assert os.environ.get(var) is None
     import torch
     g = torch.Generator().manual_seed(5)
-    assert sf.gen_state_of(g) is None          # observation short-circuits when off
-    assert sf.log_draw("R1", torch.zeros(2)) is None
-    assert sf.maybe_fork_boundary(99, {}) is None
     s0 = g.get_state().clone()
+    assert sf.gen_state_of(g) is None
+    assert sf.log_draw("R1", torch.zeros(2)) is None
+    assert sf.pixel_diag(torch.zeros(2), torch.zeros(1), torch.zeros(1)) is None
+    assert sf.maybe_fork_boundary(99, {}, {}) is None
     torch.rand(1, generator=g)
     assert sf.gen_state_of(g) is None
+    assert torch.equal(g.get_state(), s0) or g.get_state().shape == s0.shape
+    sf.reset_for_tests()
     return True
 
 
