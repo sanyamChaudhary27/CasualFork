@@ -83,7 +83,9 @@ META_PATCH_FAILURE = "META_PATCH_FAILURE"
 # Strict CPU RNG evidence recorded by the emitter meta (condition B); both
 # branches must carry identical values because the seed derivation excludes
 # branch identity.
-STRICT_CPU_META_FIELDS = ("strict_cpu_rng_seed", "cpu_rng_sha256_after_init")
+STRICT_CPU_META_FIELDS = ("strict_cpu_rng_policy", "strict_cpu_rng_seed",
+                          "cpu_rng_sha256_after_init",
+                          "cpu_rng_sha256_at_fork")
 
 
 def validate_status(status):
@@ -189,6 +191,18 @@ def check_manifest(m):
     if not isinstance(run_ids, dict) or \
             any(r not in run_ids for r in ("factual", "counterfactual")):
         return ["PAIR_MANIFEST_RUN_IDS: need entries for factual+counterfactual"]
+    def null_or_empty(value):
+        return value is None or (hasattr(value, "__len__") and len(value) == 0)
+
+    required_values = ("pair_id", "upstream_pin", "patch_sha256",
+                       "profile_sha256", "common_config_sha256",
+                       "parent_state_digest", "child_state_digest")
+    for key in required_values:
+        if null_or_empty(m.get(key)):
+            return ["PAIR_MANIFEST_REQUIRED_VALUE:%s is null/empty" % key]
+    for role in ("factual", "counterfactual"):
+        if null_or_empty(run_ids.get(role)):
+            return ["PAIR_MANIFEST_REQUIRED_VALUE:run_ids.%s is null/empty" % role]
     if run_ids["factual"] == run_ids["counterfactual"]:
         return ["RUN_ID_COLLISION: manifest declares identical run_ids"]
     try:
@@ -368,8 +382,12 @@ def validate_pair(factual_log, cf_log, pair_manifest,
                           # launch-strict re-flags it below and the GPU
                           # countersign helper refuses it unconditionally
             reasons.append("META_MISMATCH:%s across branches" % soft)
-    fw, cw = fm.get("warp_seed") or {}, cm.get("warp_seed") or {}
-    if fw != cw:
+    fw, cw = fm.get("warp_seed"), cm.get("warp_seed")
+    if not isinstance(fw, dict) or not isinstance(cw, dict):
+        reasons.append("META_MISMATCH:warp_seed factual=%r cf=%r (expected object)"
+                       % (fw, cw))
+        fw, cw = {}, {}
+    elif fw != cw:
         reasons.append("META_MISMATCH:warp_seed factual=%r cf=%r" % (fw, cw))
     if fw.get("present") is not True:
         reasons.append("PRECOND1_GLOBAL_RNG_BYPASS:meta warp_seed absent")
@@ -380,11 +398,13 @@ def validate_pair(factual_log, cf_log, pair_manifest,
     # -- strict CPU RNG evidence (condition B) --------------------------------
     for sfield in STRICT_CPU_META_FIELDS:
         sv, cv_ = fm.get(sfield), cm.get(sfield)
-        if sv is not None or cv_ is not None:
-            if sv != cv_:
-                reasons.append("META_MISMATCH:%s factual=%r cf=%r "
-                               "(derived seed is branch-independent)"
-                               % (sfield, sv, cv_))
+        if sv is None or cv_ is None:
+            reasons.append("F10_EVIDENCE_MISSING:%s factual=%r cf=%r"
+                           % (sfield, sv, cv_))
+        elif sv != cv_:
+            reasons.append("META_MISMATCH:%s factual=%r cf=%r "
+                           "(derived seed is branch-independent)"
+                           % (sfield, sv, cv_))
 
     # -- launch-strict identity gate (condition 3/D) ---------------------------
     launch_strict = bool(m.get("launch_strict")) or \
@@ -597,6 +617,7 @@ def validate_pair(factual_log, cf_log, pair_manifest,
         "grammar_violations": grammar_violations,
         "pair_id": m.get("pair_id"),
         "run_ids": {"factual": f_run, "counterfactual": c_run},
+        "launch_strict": m.get("launch_strict"),
     }
     validate_status(status)
     return result
@@ -644,13 +665,18 @@ def _r7_cross_branch(fd, cd):
 def refuse_gpu_countersign(result_or_manifest):
     """Return True when the result/manifest may NEVER be GPU-countersigned.
 
-    Hard-refuses whenever an identity field (patch/profile/config sha256,
+    Hard-refuses unless archival ``launch_strict`` is literally true, whenever
+    an identity field (patch/profile/config sha256,
     diffusers string) carries the literal "UNDECLARED" or the explicit local-CPU
     "TEST_MODE_ONLY" marker, or when a validation result already carries
     IDENTITY_UNDECLARED reasons. Such ledgers prove only that a harness ran on a
     box without the real dependency stack; they cannot anchor a GPU-01 run.
     """
     blockers = []
+
+    if not isinstance(result_or_manifest, dict) or \
+            result_or_manifest.get("launch_strict") is not True:
+        blockers.append("launch_strict is not true")
 
     def scan(o, path):
         if isinstance(o, dict):

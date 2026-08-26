@@ -57,3 +57,13 @@ Record decisions, not brainstorming. Every entry must state what evidence would 
 **Evidence:** sealed panel 5/6 + adjudication in `fanin/2026-08-24-novelty/`; canonical update commit (RESEARCH/CLAIMS/SPEC/SOURCES/EXPERIMENTS) countersigned by independent reviewer after one REJECT round fixed pointer/wording defects.
 
 **Reverse if:** Twin Rollouts v2 (or any shipped fork-with-shared-noise implementation on an open interactive video WM) publishes executed experiments before us; or GF0 returns INFEASIBLE on every credible backend and the fallback demo cannot honestly carry the thesis.
+
+## D008 — Withhold GPU-01 authorization after final micro-round F10 binding review (2026-08-26)
+
+**Decision:** Do not countersign or execute GPU-01. The final micro-round's two sealed reviewers both returned `PATCH_INCOMPLETE`; the proposal remains NOT EXECUTED.
+
+**Why:** `harness/strict_coupling.py:398-407` validates F10 meta evidence only across branches, while `:572-603` compares digest artifacts only to each other. It never requires each digest F10 hash to equal its corresponding `cpu_rng_sha256_at_fork`; equal null/rehashed digest F10 values plus synthetic equal meta can falsely certify `STRICT_NOISE_COUPLED`.
+
+**Evidence:** `fanin/2026-08-25-semantics/final-micro-round-review-record.md`; sealed M `ses_fc17fc901ffeoe1YiwtRx33NH8` and G `ses_fc17fc815ffeJ7x34dt22DaV48`; direct code inspection above.
+
+**Reverse if:** a CPU fix binds non-null digest F10 to each ledger's at-fork F10 meta, regression-tests the equal-null-digest attack, closes the reviewer-recorded parser/F12/F08/launcher issues as applicable, and a fresh sealed dual delta review returns `PATCH_READY_GPU01_READY`.

@@ -35,7 +35,10 @@ the validator fails the pair otherwise (`META_MISMATCH:common_config_sha256`).
 ## 2. Launch-strict mode
 
 Set `launch_strict: true` in the pair manifest OR export
-`EVOKE_STRICT_LAUNCH=1`. Effect (validator): literal `UNDECLARED` — or the
+`EVOKE_STRICT_LAUNCH=1`. Archive GPU-01 pair manifests MUST record the literal
+`"launch_strict": true`; missing, `false`, or `null` is refused by
+`refuse_gpu_countersign()`. Routine local `TEST_MODE_ONLY` fixtures may omit it.
+Effect (validator): literal `UNDECLARED` — or the
 local-CPU marker `TEST_MODE_ONLY` — in ANY of `patch_sha256`,
 `profile_sha256`, `common_config_sha256`, `diffusers` (either branch meta)
 yields `INVALID` with reason `IDENTITY_UNDECLARED:<field>:<role>`. A missing
@@ -95,7 +98,7 @@ to the fork hook. F-id -> live source map (audited pin line numbers):
 | F05 | geo_da3_bank._pt_mask | da3_cloud.py:606 | DA3FrameBank instance | REQ |
 | F06 | geo_da3_bank._probation/_carve_strike/_win_hist/_pinned_wins | da3_cloud.py:530/:557/:598/:597 | DA3FrameBank instance | REQ |
 | F07 | _geo_persist_feat_map / _geo_persist_feat_map_conv_idx | self._geo_persist_feat_map pipeline_evoke.py:467/:473/:516/:3044; conv idx = vae._conv_idx :474/:502/:507 | pipeline-persistent between chunks | REQ |
-| F08 | counters_set | da3_cloud.py:538 (_ingest_calls) /:599 (_sr_ingests) /:600 (_sr_last) /:577 (_ca_seen); pipeline_evoke.py:2328+:2716 (_short_tier_print_count) /:457-464 (_decode_dump_idx, 0 while env off) | live counters, snapshotted into a scalar dict at build | REQ |
+| F08 | counters_set | da3_cloud.py:538 (_ingest_calls) /:599 (_sr_ingests) /:600 (_sr_last) /:577 (_ca_seen); pipeline_evoke.py:457-464 (_decode_dump_idx, 0 while env off) | live counters, snapshotted into a scalar dict at build | REQ |
 | F09 | estimator_stream_digest | ViGeo stream scalars vigeo_cloud.py:340 (_scale_locked)/:152+:338 (_anchor_scales); kv-cache `_kv` EXCLUDED (F15). sha256 over canonical JSON of {class,_scale_locked,n_anchor_scales,process_res} | computed read-only at build | ADVISORY |
 | F10 | global_cpu_rng_sha256 (+ meta policy block) | torch default CPU generator state; seeded per section 4 | process-global | REQ |
 | F11 | _geo_cfg_mirror_K_pix/_stride/_lag | geo_state["da3_K_pix"]:724 / ["da3_pix_stride"]:725 / ["da3_lag"]:730 | geo_state dict | REQ |
@@ -107,6 +110,21 @@ to the fork hook. F-id -> live source map (audited pin line numbers):
 Residual honesty note: `restrict_self_attn` and `invisible_history_noise` are
 not visible inside `__call__` scope; they remain PREFLIGHT-side assertions
 (sc1_preflight.FORBIDDEN_RULES), not F14 entries.
+
+`_short_tier_print_count` is intentionally excluded from F08. Source audit
+finds it serves progress/logging only, with no generation-state consumer; it
+cannot establish or break causal boundary equivalence.
+
+## 7. cuDNN and flash-attn bring-up
+
+Before model construction, the launcher records `torch.backends.cudnn.benchmark`
+and `.deterministic` in `harness/env_fingerprint.py`. Set them to `False` and
+`True`, respectively, before loading the model. These are deterministic-mode
+hints, not a guarantee for every kernel or estimator implementation.
+
+Run `python harness/flash_attn_preflight.py` before importing/loading any model.
+An import or version failure reports `ENV_BRINGUP_FAILURE`; it is an environment
+bring-up failure, never an SC1 coupling verdict.
 
 ## 6. Lazy-meta continuation rewrite (condition 4/E)
 

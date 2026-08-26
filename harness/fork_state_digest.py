@@ -135,6 +135,36 @@ def digest_value(v):
             "sha256": _sha_bytes(payload.encode("utf-8"))}
 
 
+def _f13_mode_consistency(i2v, anchor):
+    """Mirror of the emitter helper (patches/evoke_strict_fork.py.txt):
+    i2v True => anchor MUST be None; i2v False => anchor MUST be a non-None
+    int. Returns None when legal, else "F13_MODE_INCONSISTENT"."""
+    if i2v is True:
+        ok = anchor is None
+    elif i2v is False:
+        ok = isinstance(anchor, int) and not isinstance(anchor, bool)
+    else:
+        ok = False
+    return None if ok else "F13_MODE_INCONSISTENT"
+
+
+def _f12_main_generator_reasons(gens):
+    """F12 MAIN-GENERATOR INVARIANT (mirrors the emitter exactly):
+    generators["main"] MUST exist with status OK, non-empty sha256,
+    nbytes > 0; auxiliary generators can NEVER satisfy F12."""
+    g = gens.get("main") if isinstance(gens, dict) else None
+    if g is None:
+        return ["F12_MAIN_GENERATOR_MISSING"]
+    try:
+        st = g.get_state().contiguous().reshape(-1).numpy().tobytes()
+        sha = hashlib.sha256(st).hexdigest()
+    except Exception:
+        return ["F12_MAIN_GENERATOR_INVALID"]
+    if not st or not sha:
+        return ["F12_MAIN_GENERATOR_INVALID"]
+    return []
+
+
 def _resolve(root, dotted):
     cur = root
     for part in dotted.split("."):
@@ -151,7 +181,28 @@ def _resolve(root, dotted):
 
 def capture(root, generators=None, fork_chunk=None, branch_id=None,
             pin="74d268516d95c8fceadd2378f91a73f9f187042b"):
-    """Build a FORK_STATE_DIGEST manifest from a pipeline-like root object."""
+    """Build a FORK_STATE_DIGEST manifest from a pipeline-like root object.
+
+    Mirrors the patched-emitter preconditions: loud structured aborts on F13
+    engine-mode inconsistency and on F12 main-generator violations."""
+    # F13 mode consistency (evaluated when both live values resolve).
+    ok_i2v, i2v = _resolve(root, "_geo_i2v_flag_assert")
+    ok_an, anchor = _resolve(root, "_geo_anchor_pix_idx_assert")
+    if ok_i2v and ok_an:
+        why = _f13_mode_consistency(i2v, anchor)
+        if why:
+            raise RuntimeError(
+                "[harness-fsd] %s: da3_is_i2v=%r with v2v_chunk0_anchor_pix_"
+                "idx=%r violates engine-mode semantics (i2v => None REQUIRED; "
+                "v2v => non-None int REQUIRED)." % (why, i2v, anchor))
+    # F12 main-generator invariant (fail fast).
+    f12_bad = _f12_main_generator_reasons(generators)
+    if f12_bad:
+        raise RuntimeError(
+            "[harness-fsd] %s: strict capture requires generators['main'] "
+            "(status OK, non-empty sha256, nbytes>0); auxiliary generators "
+            "cannot satisfy F12 (declared generators=%r)."
+            % ("/".join(f12_bad), sorted(generators or {})))
     fields = {}
     missing_required = []
     for fid, required, paths in FIELD_SPEC:

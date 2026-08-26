@@ -60,6 +60,18 @@ def torch_version():
         return None
 
 
+def cudnn_flags():
+    """Return the process cuDNN mode flags, or None when torch is absent."""
+    try:
+        import torch
+        return {
+            "benchmark": bool(torch.backends.cudnn.benchmark),
+            "deterministic": bool(torch.backends.cudnn.deterministic),
+        }
+    except Exception:
+        return None
+
+
 def file_sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -85,6 +97,7 @@ def fingerprint(patch_sha=None, upstream_pin=UPSTREAM_PIN):
         "torch": torch_version(),
         "cuda_runtime": cuda_runtime(),
         "gpu": gpu_name(),
+        "cudnn": cudnn_flags(),
         "diffusers": _try_version("diffusers"),
         "transformers": _try_version("transformers"),
         "numpy": np_ver,

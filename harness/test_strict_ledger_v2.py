@@ -485,8 +485,18 @@ def t_ef():
     assert fp["upstream_pin"] == ef.UPSTREAM_PIN
     assert fp["torch"] and fp["torch"].startswith("2.")
     assert fp["cuda_runtime"] is None and fp["gpu"] is None   # CPU box
+    assert set(fp["cudnn"]) == {"benchmark", "deterministic"}
     print("      [ef] diffusers=%r transformers=%r numpy=%r"
           % (fp["diffusers"], fp["transformers"], fp["numpy"]))
+    return True
+
+
+@case("ENV flash-attn preflight reports bring-up status, never SC1 status")
+def t_flash_attn_preflight():
+    import flash_attn_preflight as fap
+    report = fap.probe()
+    assert report["status"] in ("PASS", fap.ENV_BRINGUP_FAILURE)
+    assert "SC1" not in report["status"]
     return True
 
 
@@ -617,9 +627,10 @@ def t_o():
             sf.reset_for_tests()
 
             parent_digest = os.path.join(cap_dir,
-                                         "fork_state_digest_chunk1.json")
+                                          "fork_state_digest_chunk1.json")
             sidecar = os.path.join(cap_dir, "fork_capture_chunk1.json")
             assert os.path.exists(parent_digest) and os.path.exists(sidecar)
+            parent_f10 = json.load(open(parent_digest, encoding="utf-8"))["fields"]["F10"]
 
             # ---------------- child (restore) run ----------------------------
             os.environ[sf.ENV_BRANCH] = "counterfactual"
@@ -645,6 +656,14 @@ def t_o():
             c_real = c_base.replace(".jsonl", ".run-O-c.jsonl")
             f_real0 = f_base.replace(".jsonl", ".run-O-f.jsonl")
             c_objs = lines_of(c_real)
+            f_objs = lines_of(f_real0)
+            for objs, digest in ((f_objs, parent_f10), (c_objs, json.load(
+                    open(child_digest, encoding="utf-8"))["fields"]["F10"])):
+                meta = next(o for o in objs if o.get("event") == "meta")
+                assert meta["strict_cpu_rng_seed"] is not None
+                assert meta["cpu_rng_sha256_after_init"] is not None
+                assert meta["cpu_rng_sha256_at_fork"] == \
+                    digest["global_cpu_rng_sha256"]
             res_seq = min(o["seq"] for o in c_objs
                           if o.get("event") == sc.GENERATOR_STATE_RESTORED)
             early = [o for o in c_objs
@@ -678,6 +697,31 @@ def t_o():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+    return True
+
+
+@case("F10 capture refuses mismatched at-fork RNG evidence before artifacts")
+def t_f10_capture_evidence():
+    global sf
+    sf = _load_sf()
+    sf.reset_for_tests()
+    with tempfile.TemporaryDirectory() as td:
+        sf._STRICT_CPU_RNG = {
+            "policy": sf.STRICT_CPU_RNG_POLICY,
+            "seed": 1,
+            "cpu_rng_sha256_after_init": "synthetic-after-init",
+            "cpu_rng_sha256_at_fork": "not-the-live-rng-hash",
+        }
+        try:
+            sf._fork_capture(
+                {"fork_chunk": 1, "mode": "capture", "out_dir": td}, 1,
+                {"main": _t().Generator().manual_seed(20)},
+                _live_view(tu.make_engine_like_fixture(seed=1006), 1))
+            raise AssertionError("mismatched F10 evidence must reject capture")
+        except RuntimeError as exc:
+            assert "F10_BOUNDARY_MISMATCH" in str(exc)
+        assert not os.listdir(td), "F10 failure must not leave capture artifacts"
+    sf.reset_for_tests()
     return True
 
 
@@ -791,8 +835,8 @@ def t_p():
 
 
 # =========================================================== FINAL CPU ROUND ==
-@case("V1 LIVE adapter: realistic view (real banks) -> digest COMPLETE")
-def t_v1():
+@case("LIVE adapter: realistic view (real banks) -> digest COMPLETE")
+def t_live_adapter_complete():
     global sf
     sf = _load_sf()
     sf.reset_for_tests()
@@ -826,8 +870,8 @@ def t_v1():
     return True
 
 
-@case("V2 adapter: deleting a REQUIRED mapped field fails LOUDLY (never silent)")
-def t_v2():
+@case("adapter: deleting a REQUIRED mapped field fails LOUDLY (never silent)")
+def t_live_adapter_missing():
     global sf
     sf = _load_sf()
     sf.reset_for_tests()
@@ -835,13 +879,16 @@ def t_v2():
     gs, pipe, loc = fix
     del gs["prev_chunk_last_frame"]          # sabotage one mapping source
     view = _live_view(fix, 1)
-    m = sf.capture_fork_state_digest(view, {"main": None}, fork_chunk=1,
+    m = sf.capture_fork_state_digest(view,
+                                     {"main": _t().Generator().manual_seed(1)},
+                                     fork_chunk=1,
                                      branch_id="factual")
     assert m.get("missing_required_paths") == ["prev_frame_pix"], \
         m.get("missing_required_paths")
     assert m["fields"]["F02"]["paths"]["prev_frame_pix"]["status"] == "MISSING"
     # harness-side digest reports the same loud miss
-    mh = fsd.capture(view, {"main": None}, fork_chunk=1, branch_id="cf")
+    mh = fsd.capture(view, {"main": _t().Generator().manual_seed(1)},
+                     fork_chunk=1, branch_id="cf")
     assert mh.get("missing_required_paths") == ["prev_frame_pix"]
     # and the capture HOOK aborts the run loudly on such state
     import torch as _t2
@@ -859,6 +906,162 @@ def t_v2():
     finally:
         os.environ.pop(sf.ENV_FORK, None)
         sf.reset_for_tests()
+    return True
+
+
+@case("F13-I1 i2v absent upstream anchor captures with no missing required paths")
+def t_f13_i1():
+    global sf
+    sf = _load_sf()
+    sf.reset_for_tests()
+    fix = tu.make_engine_like_fixture(seed=1001)
+    gs, _pipe, _loc = fix
+    del gs["v2v_chunk0_anchor_pix_idx"]  # upstream i2v legitimately omits it
+    view = _live_view(fix, 1)
+    gens = {"main": _t().Generator().manual_seed(11)}
+    emitter = sf.capture_fork_state_digest(view, gens, fork_chunk=1,
+                                            branch_id="factual")
+    harness = fsd.capture(view, gens, fork_chunk=1, branch_id="factual")
+    for digest in (emitter, harness):
+        assert digest.get("missing_required_paths") is None
+        entry = digest["fields"]["F13"]["paths"]["_geo_anchor_pix_idx_assert"]
+        assert entry["status"] == "OK" and entry["kind"] == "NoneType"
+    sf.reset_for_tests()
+    return True
+
+
+@case("F13-I2 factual/replay F13 hashes are equal")
+def t_f13_i2():
+    global sf
+    sf = _load_sf()
+    sf.reset_for_tests()
+    factual = tu.make_engine_like_fixture(seed=1002)
+    replay = tu.make_engine_like_fixture(seed=1002)
+    for fix in (factual, replay):
+        del fix[0]["v2v_chunk0_anchor_pix_idx"]
+    mf = sf.capture_fork_state_digest(_live_view(factual, 1),
+                                      {"main": _t().Generator().manual_seed(12)},
+                                      fork_chunk=1, branch_id="factual")
+    mr = sf.capture_fork_state_digest(_live_view(replay, 1),
+                                      {"main": _t().Generator().manual_seed(12)},
+                                      fork_chunk=1, branch_id="counterfactual")
+    assert mf["fields"]["F13"]["group_sha256"] == \
+        mr["fields"]["F13"]["group_sha256"]
+    sf.reset_for_tests()
+    return True
+
+
+@case("F13-I3 i2v fabricated anchor rejects F13_MODE_INCONSISTENT")
+def t_f13_i3():
+    global sf
+    sf = _load_sf()
+    sf.reset_for_tests()
+    fix = tu.make_engine_like_fixture(seed=1003)
+    fix[0]["v2v_chunk0_anchor_pix_idx"] = 7
+    view = _live_view(fix, 1)
+    for capture in (sf.capture_fork_state_digest, fsd.capture):
+        try:
+            capture(view, {"main": _t().Generator().manual_seed(13)},
+                    fork_chunk=1, branch_id="factual")
+            raise AssertionError("fabricated i2v anchor must reject")
+        except RuntimeError as exc:
+            assert "F13_MODE_INCONSISTENT" in str(exc)
+    sf.reset_for_tests()
+    return True
+
+
+@case("V1 v2v integer anchor captures")
+def t_v2v_integer_anchor():
+    global sf
+    sf = _load_sf()
+    sf.reset_for_tests()
+    fix = tu.make_engine_like_fixture(seed=1004)
+    fix[0]["da3_is_i2v"] = False
+    fix[0]["v2v_chunk0_anchor_pix_idx"] = 0
+    digest = sf.capture_fork_state_digest(
+        _live_view(fix, 1), {"main": _t().Generator().manual_seed(14)},
+        fork_chunk=1, branch_id="factual")
+    assert digest.get("missing_required_paths") is None
+    sf.reset_for_tests()
+    return True
+
+
+@case("V2 v2v absent or None anchor rejects F13_MODE_INCONSISTENT")
+def t_v2v_missing_anchor():
+    global sf
+    sf = _load_sf()
+    for anchor in ("absent", None):
+        sf.reset_for_tests()
+        fix = tu.make_engine_like_fixture(seed=1005)
+        fix[0]["da3_is_i2v"] = False
+        if anchor == "absent":
+            del fix[0]["v2v_chunk0_anchor_pix_idx"]
+        else:
+            fix[0]["v2v_chunk0_anchor_pix_idx"] = None
+        try:
+            sf.capture_fork_state_digest(
+                _live_view(fix, 1), {"main": _t().Generator().manual_seed(15)},
+                fork_chunk=1, branch_id="factual")
+            raise AssertionError("v2v missing/None anchor must reject")
+        except RuntimeError as exc:
+            assert "F13_MODE_INCONSISTENT" in str(exc)
+    sf.reset_for_tests()
+    return True
+
+
+@case("F12 main-valid pass")
+def t_f12_main_valid():
+    root = tu.make_mock_root()
+    digest = fsd.capture(root, {"main": _t().Generator().manual_seed(16)})
+    main = digest["fields"]["F12"]["generators"]["main"]
+    assert main["status"] == "OK" and main["sha256"] and main["nbytes"] > 0
+    return True
+
+
+@case("F12 empty-main fails F12_MAIN_GENERATOR_INVALID")
+def t_f12_empty_main():
+    class EmptyGenerator:
+        def get_state(self):
+            return _t().empty(0, dtype=_t().uint8)
+    try:
+        fsd.capture(tu.make_mock_root(), {"main": EmptyGenerator()})
+        raise AssertionError("empty main state must reject")
+    except RuntimeError as exc:
+        assert "F12_MAIN_GENERATOR_INVALID" in str(exc)
+    return True
+
+
+@case("F12 auxiliary-only fails F12_MAIN_GENERATOR_MISSING")
+def t_f12_auxiliary_only():
+    try:
+        fsd.capture(tu.make_mock_root(),
+                    {"geo_patchdrop": _t().Generator().manual_seed(17)})
+        raise AssertionError("auxiliary generator must not substitute for main")
+    except RuntimeError as exc:
+        assert "F12_MAIN_GENERATOR_MISSING" in str(exc)
+    return True
+
+
+@case("F12 invalid-main fails F12_MAIN_GENERATOR_INVALID")
+def t_f12_invalid_main():
+    class InvalidGenerator:
+        def get_state(self):
+            raise RuntimeError("synthetic invalid generator")
+    try:
+        fsd.capture(tu.make_mock_root(), {"main": InvalidGenerator()})
+        raise AssertionError("invalid main generator must reject")
+    except RuntimeError as exc:
+        assert "F12_MAIN_GENERATOR_INVALID" in str(exc)
+    return True
+
+
+@case("F12 main-plus-aux pass")
+def t_f12_main_plus_aux():
+    digest = fsd.capture(tu.make_mock_root(), {
+        "main": _t().Generator().manual_seed(18),
+        "geo_patchdrop": _t().Generator().manual_seed(19),
+    })
+    assert sorted(digest["fields"]["F12"]["generators"]) == ["geo_patchdrop", "main"]
     return True
 
 
@@ -1083,13 +1286,54 @@ def t_ls_artifact():
     return True
 
 
-@case("LS TEST_MODE_ONLY ledgers are NEVER GPU-countersignable")
-def t_ls_refuse():
+@case("LS GPU countersign refuses missing or false launch_strict")
+def t_ls_refuse_launch_strict():
     with tempfile.TemporaryDirectory() as td:
         fp, cp, man = tu.standard_pair(td)
         r = sc.validate_pair(fp, cp, man)
         assert sc.is_pass(r)
-        assert sc.refuse_gpu_countersign(r) is False      # clean pass -> allow
+        assert sc.refuse_gpu_countersign(r) is True
+        assert sc.refuse_gpu_countersign(man) is True
+        man_false = copy.deepcopy(man)
+        man_false["launch_strict"] = False
+        assert sc.refuse_gpu_countersign(man_false) is True
+        man_null = copy.deepcopy(man)
+        man_null["launch_strict"] = None
+        assert sc.refuse_gpu_countersign(man_null) is True
+    return True
+
+
+@case("LS GPU countersign permits launch_strict true with real identity IDs")
+def t_ls_launch_strict_eligible():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        identities = {
+            "patch_sha256": "a" * 64,
+            "profile_sha256": "b" * 64,
+            "common_config_sha256": "c" * 64,
+        }
+
+        def real_ids(objs):
+            for obj in objs:
+                if obj.get("event") == "meta":
+                    obj.update(identities)
+            return objs
+        fp2 = rewrite(fp, real_ids, "real-f.jsonl")
+        cp2 = rewrite(cp, real_ids, "real-c.jsonl")
+        man2 = remanifest(man, fp2, cp2)
+        man2.update(identities)
+        man2["launch_strict"] = True
+        r = sc.validate_pair(fp2, cp2, man2)
+        assert sc.is_pass(r), sc.format_result(r)
+        assert sc.refuse_gpu_countersign(r) is False
+        assert sc.refuse_gpu_countersign(man2) is False
+    return True
+
+
+@case("LS TEST_MODE_ONLY ledgers are NEVER GPU-countersignable")
+def t_ls_refuse_markers():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
         man_t = copy.deepcopy(man)
         man_t["patch_sha256"] = "TEST_MODE_ONLY"
         assert sc.refuse_gpu_countersign(man_t) is True
@@ -1106,6 +1350,68 @@ def t_ls_refuse():
         objs = lines_of(cp2)
         tmo_meta = next(o for o in objs if o.get("event") == "meta")
         assert sc.refuse_gpu_countersign({"metas": [tmo_meta]}) is True
+    return True
+
+
+@case("HYG required pair-manifest values reject null and empty")
+def t_required_manifest_values():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        for key in ("pair_id", "upstream_pin", "patch_sha256", "profile_sha256",
+                    "common_config_sha256", "parent_state_digest",
+                    "child_state_digest"):
+            for bad in (None, ""):
+                probe = copy.deepcopy(man)
+                probe[key] = bad
+                assert any(x.startswith("PAIR_MANIFEST_REQUIRED_VALUE:%s" % key)
+                           for x in sc.check_manifest(probe))
+        for role in ("factual", "counterfactual"):
+            probe = copy.deepcopy(man)
+            probe["run_ids"][role] = None
+            assert any(x.startswith("PAIR_MANIFEST_REQUIRED_VALUE:run_ids.%s" % role)
+                       for x in sc.check_manifest(probe))
+    return True
+
+
+@case("HYG truthy non-dict warp_seed is META_MISMATCH/INVALID, never AttributeError")
+def t_warp_seed_type():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+
+        def poison(objs):
+            for obj in objs:
+                if obj.get("event") == "meta":
+                    obj["warp_seed"] = "truthy-not-an-object"
+            return objs
+        cp2 = rewrite(cp, poison, "warp-type.jsonl")
+        man2 = remanifest(man, fp, cp2)
+        r = sc.validate_pair(fp, cp2, man2)
+        assert not sc.is_pass(r)
+        assert any(x.startswith("META_MISMATCH:warp_seed") for x in r["reasons"])
+    return True
+
+
+@case("F10 validator rejects pair with both at-fork evidence missing or null")
+def t_f10_missing_pair_evidence():
+    with tempfile.TemporaryDirectory() as td:
+        for marker in ("missing", None):
+            fp, cp, man = tu.standard_pair(td)
+
+            def poison(objs, value=marker):
+                for obj in objs:
+                    if obj.get("event") == "meta":
+                        if value == "missing":
+                            obj.pop("cpu_rng_sha256_at_fork", None)
+                        else:
+                            obj["cpu_rng_sha256_at_fork"] = value
+                return objs
+            fp2 = rewrite(fp, poison, "f10-f-%s.jsonl" % str(marker))
+            cp2 = rewrite(cp, poison, "f10-c-%s.jsonl" % str(marker))
+            man2 = remanifest(man, fp2, cp2)
+            r = sc.validate_pair(fp2, cp2, man2)
+            assert not sc.is_pass(r)
+            assert any(x.startswith("F10_EVIDENCE_MISSING:cpu_rng_sha256_at_fork")
+                       for x in r["reasons"]), r["reasons"]
     return True
 
 
@@ -1149,9 +1455,15 @@ def t_mpf():
             real_open = open
             target = os.path.abspath(base.replace(".jsonl", ".run-MPF2.jsonl"))
 
+            reads = {"target": 0}
+
             def sabotaged(path, mode="r", *a, **k):
                 if mode == "r" and os.path.abspath(str(path)) == target:
-                    raise OSError("MPF-simulated read failure")
+                    reads["target"] += 1
+                    # F10 evidence rewrites first; sabotage the later lazy
+                    # continuation rewrite that this case is designed to test.
+                    if reads["target"] > 1:
+                        raise OSError("MPF-simulated read failure")
                 return real_open(path, mode, *a, **k)
             import builtins
             builtins.open, saved = sabotaged, builtins.open

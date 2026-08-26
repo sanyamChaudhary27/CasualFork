@@ -168,6 +168,10 @@ def build_branch(role="factual", run_id="run-x", chunks=3, fork_chunk=1,
         "warp_seed": {"present": True, "sha256": WARP_SEED_SHA},
         "branch_id": role, "run_id": run_id, "pair_id": PAIR_ID,
         "continuation": continuation, "env_fork_present": True,
+        "strict_cpu_rng_policy": "causalfork/sc1-strict-cpu-rng@1",
+        "strict_cpu_rng_seed": 20260826,
+        "cpu_rng_sha256_after_init": "f10-after-init-test",
+        "cpu_rng_sha256_at_fork": "f10-at-fork-test",
     }
     return meta, entries, events
 
@@ -273,7 +277,6 @@ def make_engine_like_fixture(seed=1000):
     pipeline_stub = types.SimpleNamespace(
         vae=types.SimpleNamespace(_conv_idx=[0]),
         _geo_persist_feat_map=t(1, 8, 4, 6, 10),
-        _short_tier_print_count=0,
         _decode_dump_idx=0,
     )
     locals_view = {
@@ -311,7 +314,6 @@ def make_mock_root(seed=1234, real_banks=True):
         "counters_set": {
             "da3_bank__ingest_calls": 42, "da3_bank__sr_ingests": 0,
             "da3_bank__sr_last": -10 ** 9, "da3_bank__ca_seen": 0,
-            "pipeline__short_tier_print_count": 0,
             "pipeline__decode_dump_idx": 0,
         },
         # F07 persistent VAE feature cache + conv idx mirror

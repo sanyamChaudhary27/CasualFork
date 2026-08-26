@@ -581,9 +581,10 @@ _LIVE_VIEW_RESOLVERS = {
                                                None),
     "_geo_persist_feat_map_conv_idx": lambda r: getattr(
         getattr(r["pipe"], "vae", None), "_conv_idx", None),
-    # F08 - audited counters: da3_cloud.py:538(_ingest_calls)/:599(_sr_ingests)/
-    # :600(_sr_last)/:577(_ca_seen); pipeline_evoke.py:2328+:2716(print count)/
-    # :457-464(decode dump idx; 0 while EVOKE_SAVE_DECODE_LATENTS unset).
+    # F08 - causal counters only: da3_cloud.py:538(_ingest_calls)/:599(_sr_ingests)/
+    # :600(_sr_last)/:577(_ca_seen), plus decode-dump index :457-464. The
+    # logging-only _short_tier_print_count is deliberately excluded: it does
+    # not influence generation and therefore is not causal fork state.
     "counters_set": lambda r: {
         "da3_bank__ingest_calls": getattr(r["gs"].get("da3_bank"),
                                           "_ingest_calls", None),
@@ -591,11 +592,8 @@ _LIVE_VIEW_RESOLVERS = {
                                         "_sr_ingests", None),
         "da3_bank__sr_last": getattr(r["gs"].get("da3_bank"), "_sr_last", None),
         "da3_bank__ca_seen": getattr(r["gs"].get("da3_bank"), "_ca_seen", None),
-        "pipeline__short_tier_print_count": getattr(r["pipe"],
-                                                    "_short_tier_print_count",
-                                                    None),
         "pipeline__decode_dump_idx": getattr(r["pipe"], "_decode_dump_idx",
-                                             None),
+                                              None),
     },
     # F09 - ADVISORY stream digest (kv-cache excluded, F15 class).
     "estimator_stream_digest": lambda r: _estimator_stream_digest(
@@ -611,12 +609,24 @@ _LIVE_VIEW_RESOLVERS = {
     #   event_set emptiness from len(_event_set) (:2002), passed by the patched
     #   hunk (camera cursor is k+event_set-derived -> config assertion, not
     #   state - adjudication "Additional facts frozen").
+    # MODE-AWARE ANCHOR SEMANTICS (final delta review blocking item 1):
+    # upstream creates geo_state["v2v_chunk0_anchor_pix_idx"] ONLY on the v2v
+    # path (:2225-2232, inside `if _is_v2v_geo:`); an i2v rollout (GPU-01's
+    # engine mode; da3_is_i2v=(not _is_v2v_geo) :2289) NEVER has that key, so
+    # the former _require_key read raised a deterministic AttributeError ->
+    # capture RuntimeError on BOTH branches. The anchor resolver is therefore
+    # PRESENT-OR-NONE (never loud): an ABSENT key resolves to None and None is
+    # a legitimate DIGESTED VALUE (explicit "N:" none-representation), not a
+    # missing field. Mode legality is asserted inside capture_fork_state_digest
+    # instead: da3_is_i2v True => anchor MUST be None; da3_is_i2v False =>
+    # anchor MUST be a non-None int.
     "_geo_source_image_sha": lambda r: (
         tensor_sha256(_require_key(r["gs"], "source_image_pixel"))
         if r["gs"].get("source_image_pixel") is not None else None),
     "_geo_i2v_flag_assert": lambda r: _require_key(r["gs"], "da3_is_i2v"),
-    "_geo_anchor_pix_idx_assert": lambda r: _require_key(
-        r["gs"], "v2v_chunk0_anchor_pix_idx"),
+    "_geo_anchor_pix_idx_assert": lambda r: (
+        r["gs"].get("v2v_chunk0_anchor_pix_idx")
+        if isinstance(r["gs"], dict) else None),
     "event_set_empty_assert": lambda r: (
         None if r["evs"] is None else (int(r["evs"]) == 0)),
     # F14 - forced-off flags captured from __call__ locals by the patched hunk
@@ -752,9 +762,88 @@ def _digest_entry(v):
             "sha256": _sha_of_raw(_digest_walk(v).encode("utf-8"))}
 
 
+def _f13_mode_consistency(i2v, anchor):
+    """Mode legality of the v2v anchor (final delta review blocking item 1).
+
+    da3_is_i2v True  (i2v rollout) => anchor MUST be None (a legitimate
+    DIGESTED VALUE, hashed as an explicit none-representation, NOT missing).
+    da3_is_i2v False (v2v rollout) => anchor MUST be a non-None int (bools
+    excluded). Returns None when legal, else the structured reason string.
+    """
+    if i2v is True:
+        ok = anchor is None
+    elif i2v is False:
+        ok = isinstance(anchor, int) and not isinstance(anchor, bool)
+    else:
+        ok = False
+    return None if ok else "F13_MODE_INCONSISTENT"
+
+
+def _f12_main_generator_reasons(gens):
+    """F12 MAIN-GENERATOR INVARIANT (final delta review blocking item 2):
+    generators["main"] MUST exist with status OK, a non-empty sha256 and
+    nbytes > 0. Auxiliary generators hash normally but can NEVER satisfy F12.
+    Returns structured failure reasons (empty list == satisfied)."""
+    g = gens.get("main") if isinstance(gens, dict) else None
+    if g is None:
+        return ["F12_MAIN_GENERATOR_MISSING"]
+    try:
+        st = g.get_state().contiguous().reshape(-1).numpy().tobytes()
+        sha = hashlib.sha256(st).hexdigest()
+    except Exception:
+        return ["F12_MAIN_GENERATOR_INVALID"]
+    if not st or not sha:
+        return ["F12_MAIN_GENERATOR_INVALID"]
+    return []
+
+
+def _f10_evidence_reason(digest_f10_sha):
+    """F10 CAPTURE ASSERTION (final delta review blocking item 2): a capturable
+    strict digest may be written ONLY when strict CPU-RNG policy evidence
+    exists (seed + after-init sha recorded) AND the digest default-CPU hash
+    equals cpu_rng_sha256_at_fork recorded AT THIS boundary. Returns None when
+    certified, else a structured reason string."""
+    rec = _STRICT_CPU_RNG
+    if not rec or rec.get("policy") != STRICT_CPU_RNG_POLICY or \
+            rec.get("seed") is None or \
+            rec.get("cpu_rng_sha256_after_init") is None or \
+            rec.get("cpu_rng_sha256_at_fork") is None:
+        return "F10_EVIDENCE_MISSING"
+    if digest_f10_sha is None or             rec.get("cpu_rng_sha256_at_fork") != digest_f10_sha:
+        return "F10_BOUNDARY_MISMATCH"
+    return None
+
+
 def capture_fork_state_digest(pipeline_root, generators=None,
                               fork_chunk=None, branch_id=None):
-    """FORK_STATE_DIGEST v1 manifest; mirrors harness.fork_state_digest.capture."""
+    """FORK_STATE_DIGEST v1 manifest; mirrors harness.fork_state_digest.capture.
+
+    Preconditions enforced LOUDLY (structured RuntimeErrors, never silent
+    manifests): F13 engine-mode consistency and the F12 main-generator
+    invariant. The F10 CPU-RNG evidence assertion runs in the fork hooks
+    before any digest file is written."""
+    # F13 mode-consistency precondition: only evaluated when BOTH live values
+    # resolve; a genuinely MISSING required path still fails later through the
+    # REQUIRED-field machinery.
+    _ok_i2v, _i2v = _resolve_attr(pipeline_root, "_geo_i2v_flag_assert")
+    _ok_an, _anchor = _resolve_attr(pipeline_root,
+                                    "_geo_anchor_pix_idx_assert")
+    if _ok_i2v and _ok_an:
+        _why = _f13_mode_consistency(_i2v, _anchor)
+        if _why:
+            raise RuntimeError(
+                "[StrictFork] %s: da3_is_i2v=%r with v2v_chunk0_anchor_pix_"
+                "idx=%r violates engine-mode semantics (i2v => None REQUIRED; "
+                "v2v => non-None int REQUIRED); refusing to certify inconsist"
+                "ent mode evidence." % (_why, _i2v, _anchor))
+    # F12 main-generator invariant: fail fast BEFORE hashing/writing anything.
+    _f12_bad = _f12_main_generator_reasons(generators)
+    if _f12_bad:
+        raise RuntimeError(
+            "[StrictFork] %s: strict capture requires generators['main'] with "
+            "status OK, non-empty sha256 and nbytes>0; auxiliary generators "
+            "cannot satisfy F12 (declared generators=%r)."
+            % ("/".join(_f12_bad), sorted(generators or {})))
     fields = {}
     missing_required = []
     for fid, required, paths in STATE_DIGEST_FIELD_SPEC:
@@ -876,6 +965,43 @@ def _write_event(record):
         _LEDGER_FH.flush()
 
 
+def _patch_meta_f10_evidence():
+    """Rewrite an already-open ledger header with the boundary F10 evidence.
+
+    The header can be emitted by chunk zero before the configured fork chunk,
+    so its initial at-fork field is necessarily null. Once the true boundary
+    is reached, update it before emitting the capture/restore event.
+    """
+    if _LEDGER_FH is None or not getattr(_LEDGER_FH, "name", None):
+        return
+    path = _LEDGER_OPENED or _LEDGER_FH.name
+    rec = strict_cpu_rng_record() or {}
+    try:
+        _LEDGER_FH.flush()
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+        if not lines:
+            raise RuntimeError("ledger has no meta header")
+        head = json.loads(lines[0])
+        if head.get("event") != "meta":
+            raise RuntimeError("ledger first line is not meta")
+        head.update({
+            "strict_cpu_rng_policy": STRICT_CPU_RNG_POLICY,
+            "strict_cpu_rng_seed": rec.get("seed"),
+            "cpu_rng_sha256_after_init": rec.get("cpu_rng_sha256_after_init"),
+            "cpu_rng_sha256_at_fork": rec.get("cpu_rng_sha256_at_fork"),
+        })
+        lines[0] = json.dumps(head, sort_keys=True) + "\n"
+        _LEDGER_FH.close()
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.writelines(lines)
+        globals()["_LEDGER_FH"] = open(path, "a", encoding="utf-8", newline="\n")
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            "[StrictFork] F10_META_EVIDENCE_UNVERIFIED: cannot update strict "
+            "CPU-RNG boundary evidence (%r)" % (exc,))
+
+
 def _patch_meta_continuation():
     """Lazy-meta repair: the meta header is written at first ledger use,
     before restore status is knowable. Once a restore succeeds, rewrite the
@@ -976,21 +1102,41 @@ def _fork_capture(cfg, chunk_index, generators, pipeline=None):
             "by build_live_state_view at the true chunk boundary (got %s); "
             "raw pipelines are rejected so the digest provably reads boundary "
             "state, not stale attributes." % type(pipeline).__name__)
-    os.makedirs(out_dir, exist_ok=True)
     if _STRICT_CPU_RNG is not None and _STRICT_CPU_RNG.get(
             "cpu_rng_sha256_at_fork") is None:
         _STRICT_CPU_RNG["cpu_rng_sha256_at_fork"] = global_rng_digest()
+    # Build and validate the digest BEFORE creating any capture artifact. This
+    # makes F12/F13/F10 failures terminal rather than leaving partial sidecars.
+    digest = capture_fork_state_digest(pipeline, generators,
+                                       fork_chunk=chunk_index,
+                                       branch_id=get_branch_id())
+    _f10_why = _f10_evidence_reason(
+        ((digest.get("fields") or {}).get("F10") or {})
+        .get("global_cpu_rng_sha256"))
+    if _f10_why:
+        raise RuntimeError(
+            "[StrictFork] %s: FORK_STATE_DIGEST refused at chunk %d - strict "
+            "CPU-RNG policy evidence (strict_cpu_rng_seed, "
+            "cpu_rng_sha256_after_init, cpu_rng_sha256_at_fork) must exist and "
+            "equal the boundary F10 global_cpu_rng_sha256." % (_f10_why,
+                                                               chunk_index))
+    _patch_meta_f10_evidence()
+    if digest.get("missing_required_paths"):
+        raise RuntimeError(
+            "[StrictFork] FORK_STATE_DIGEST missing REQUIRED fields: %s"
+            % (sorted(set(digest["missing_required_paths"])),))
+    os.makedirs(out_dir, exist_ok=True)
     gens_json = {}
     for name in sorted(generators):
         g = generators[name]
         st = g.get_state().cpu().contiguous()
         raw = st.reshape(-1).numpy().tobytes()
-        digest = sha256_bytes(raw)
+        gen_digest = sha256_bytes(raw)
         pt_path = os.path.join(out_dir, "genstate_%s_chunk%d.pt"
                                % (name, chunk_index))
         torch.save({"name": name, "chunk": chunk_index,
                     "pin": PATCH_TARGET_PIN, "state": st}, pt_path)
-        gens_json[name] = {"path": pt_path, "sha256": digest, "nbytes": len(raw)}
+        gens_json[name] = {"path": pt_path, "sha256": gen_digest, "nbytes": len(raw)}
     sidecar = {
         "kind": "EVOKE_STRICT_FORK_CAPTURE",
         "pin": PATCH_TARGET_PIN,
@@ -1008,14 +1154,7 @@ def _fork_capture(cfg, chunk_index, generators, pipeline=None):
     sc_path = os.path.join(out_dir, "fork_capture_chunk%d.json" % chunk_index)
     with open(sc_path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(sidecar, fh, indent=2, sort_keys=True)
-    # FORK_STATE_DIGEST sidecar next to the generator capture (REQUIRED)
-    digest = capture_fork_state_digest(pipeline, generators,
-                                       fork_chunk=chunk_index,
-                                       branch_id=get_branch_id())
-    if digest.get("missing_required_paths"):
-        raise RuntimeError(
-            "[StrictFork] FORK_STATE_DIGEST missing REQUIRED fields: %s"
-            % (sorted(set(digest["missing_required_paths"])),))
+    # FORK_STATE_DIGEST sidecar next to the generator capture (REQUIRED).
     dg_path = os.path.join(out_dir, "fork_state_digest_chunk%d.json"
                            % chunk_index)
     with open(dg_path, "w", encoding="utf-8", newline="\n") as fh:
@@ -1080,9 +1219,21 @@ def _fork_restore(cfg, chunk_index, generators, pipeline=None):
     with open(parent_path, "r", encoding="utf-8") as fh:
         parent_digest = json.load(fh)
     out_dir = os.path.dirname(os.path.abspath(side)) or "."
+    if _STRICT_CPU_RNG is not None and _STRICT_CPU_RNG.get(
+            "cpu_rng_sha256_at_fork") is None:
+        _STRICT_CPU_RNG["cpu_rng_sha256_at_fork"] = global_rng_digest()
     child_digest = capture_fork_state_digest(pipeline, generators,
                                              fork_chunk=chunk_index,
                                              branch_id=get_branch_id())
+    _f10_why = _f10_evidence_reason(
+        ((child_digest.get("fields") or {}).get("F10") or {})
+        .get("global_cpu_rng_sha256"))
+    if _f10_why:
+        raise RuntimeError(
+            "[StrictFork] %s: restored branch cannot certify its boundary "
+            "state digest without matching strict CPU-RNG evidence."
+            % (_f10_why,))
+    _patch_meta_f10_evidence()
     child_path = os.path.join(out_dir, "fork_state_digest_child_chunk%d.json"
                               % chunk_index)
     with open(child_path, "w", encoding="utf-8", newline="\n") as fh:
@@ -1098,9 +1249,6 @@ def _fork_restore(cfg, chunk_index, generators, pipeline=None):
         })
         raise RuntimeError("[StrictFork] FORK_STATE_MISMATCH at chunk %d: %s"
                            % (chunk_index, json.dumps(detail, sort_keys=True)))
-    if _STRICT_CPU_RNG is not None and _STRICT_CPU_RNG.get(
-            "cpu_rng_sha256_at_fork") is None:
-        _STRICT_CPU_RNG["cpu_rng_sha256_at_fork"] = global_rng_digest()
     global _RESTORED
     with _LOCK:
         _RESTORED = CONTINUATION_MARKER
