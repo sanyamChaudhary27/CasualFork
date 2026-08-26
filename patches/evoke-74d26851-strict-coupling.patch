@@ -176,10 +176,10 @@ index 5d77a43..ddd9522 100644
              _t_diff_s = None
 diff --git a/evoke/strict_fork.py b/evoke/strict_fork.py
 new file mode 100644
-index 0000000..2f8e3b9
+index 0000000..9d496ce
 --- /dev/null
 +++ b/evoke/strict_fork.py
-@@ -0,0 +1,1304 @@
+@@ -0,0 +1,1321 @@
 +"""CausalFork SC1 strict-coupling instrumentation V2 (+ FINAL CPU ROUND adapter).
 +
 +ADDED BY PATCH evoke-74d26851-strict-coupling (STAGE-B/C fix round + FINAL CPU
@@ -299,6 +299,7 @@ index 0000000..2f8e3b9
 +ENV_CONFIG_SHA_ENGINE = "EVOKE_STRICT_CONFIG_SHA_ENGINE"
 +ENV_BASE_SEED = "EVOKE_STRICT_BASE_SEED"
 +ENV_TEST_MODE_ONLY = "EVOKE_TEST_MODE_ONLY"
++ENV_LAUNCH_STRICT = "EVOKE_STRICT_LAUNCH"
 +
 +CONTINUATION_MARKER = "GENERATOR_STATE_RESTORED"
 +META_PATCH_FAILURE_EVENT = "META_PATCH_FAILURE"
@@ -344,6 +345,23 @@ index 0000000..2f8e3b9
 +# condition B / condition E module state
 +_STRICT_CPU_RNG = None            # evidence dict or None
 +_META_CONTINUATION_VERIFIED = None   # None=never attempted, True/False
++
++
++def strict_launch_cudnn_settings():
++    """Apply and report strict-launch cuDNN hints in this engine process.
++
++    These settings do not claim determinism for every CUDA kernel.
++    """
++    if os.environ.get(ENV_LAUNCH_STRICT) == "1":
++        torch.backends.cudnn.benchmark = False
++        torch.backends.cudnn.deterministic = True
++    return {"benchmark": bool(torch.backends.cudnn.benchmark),
++            "deterministic": bool(torch.backends.cudnn.deterministic)}
++
++
++# This module is imported by the patched pipeline before its pipeline object is
++# constructed, so a strict launch resolves the process-local flags early.
++_STRICT_LAUNCH_CUDNN = strict_launch_cudnn_settings()
 +
 +
 +def get_branch_id():
@@ -647,6 +665,7 @@ index 0000000..2f8e3b9
 +        "continuation": _RESTORED,
 +        "env_fork_present": os.environ.get(ENV_FORK) is not None,
 +        "launch_strict_env": os.environ.get("EVOKE_STRICT_LAUNCH", "") == "1",
++        "cudnn": strict_launch_cudnn_settings(),
 +        "strict_cpu_rng_policy": STRICT_CPU_RNG_POLICY,
 +        "strict_cpu_rng_seed": rng_rec.get("seed"),
 +        "cpu_rng_sha256_after_init": rng_rec.get("cpu_rng_sha256_after_init"),
@@ -764,9 +783,9 @@ index 0000000..2f8e3b9
 +    "_geo_persist_feat_map_conv_idx": lambda r: getattr(
 +        getattr(r["pipe"], "vae", None), "_conv_idx", None),
 +    # F08 - causal counters only: da3_cloud.py:538(_ingest_calls)/:599(_sr_ingests)/
-+    # :600(_sr_last)/:577(_ca_seen), plus decode-dump index :457-464. The
-+    # logging-only _short_tier_print_count is deliberately excluded: it does
-+    # not influence generation and therefore is not causal fork state.
++    # :600(_sr_last)/:577(_ca_seen). _decode_dump_idx is only decode-dump
++    # logging under EVOKE_SAVE_DECODE_LATENTS, so it is excluded with the
++    # logging-only _short_tier_print_count.
 +    "counters_set": lambda r: {
 +        "da3_bank__ingest_calls": getattr(r["gs"].get("da3_bank"),
 +                                          "_ingest_calls", None),
@@ -774,8 +793,6 @@ index 0000000..2f8e3b9
 +                                        "_sr_ingests", None),
 +        "da3_bank__sr_last": getattr(r["gs"].get("da3_bank"), "_sr_last", None),
 +        "da3_bank__ca_seen": getattr(r["gs"].get("da3_bank"), "_ca_seen", None),
-+        "pipeline__decode_dump_idx": getattr(r["pipe"], "_decode_dump_idx",
-+                                              None),
 +    },
 +    # F09 - ADVISORY stream digest (kv-cache excluded, F15 class).
 +    "estimator_stream_digest": lambda r: _estimator_stream_digest(

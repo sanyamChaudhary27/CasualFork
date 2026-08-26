@@ -26,6 +26,7 @@ import sc1_grammar as gr              # noqa: E402
 import sc1_preflight as pf            # noqa: E402
 import fork_state_digest as fsd       # noqa: E402
 import env_fingerprint as ef          # noqa: E402
+import gpu01_prelaunch as gp          # noqa: E402
 
 RESULTS = []
 
@@ -1412,6 +1413,210 @@ def t_f10_missing_pair_evidence():
             assert not sc.is_pass(r)
             assert any(x.startswith("F10_EVIDENCE_MISSING:cpu_rng_sha256_at_fork")
                        for x in r["reasons"]), r["reasons"]
+    return True
+
+
+def _rewrite_digest(path, mutator, out_name):
+    digest = json.load(open(path, encoding="utf-8"))
+    mutator(digest)
+    digest.pop("manifest_sha256", None)
+    digest["manifest_sha256"] = hashlib.sha256(
+        fsd.canonical(digest).encode("utf-8")).hexdigest()
+    dst = os.path.join(os.path.dirname(path), out_name)
+    with open(dst, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(fsd.canonical(digest) + "\n")
+    return dst
+
+
+@case("F10-A loaded digests must bind to each run ledger, not merely each other")
+def t_f10_a_loaded_bind():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        bad = "a" * 64
+        dp = _rewrite_digest(man["parent_state_digest"]["path"],
+                             lambda d: d["fields"]["F10"].update(
+                                 global_cpu_rng_sha256=bad), "f10-a-p.json")
+        dc = _rewrite_digest(man["child_state_digest"]["path"],
+                             lambda d: d["fields"]["F10"].update(
+                                 global_cpu_rng_sha256=bad), "f10-a-c.json")
+        man2 = tu.make_manifest((fp, cp), (dp, dc), ("run-F-fix", "run-C-fix"))
+        result = sc.validate_pair(fp, cp, man2)
+        assert any(x == "F10_LEDGER_BIND_MISMATCH:factual" for x in result["reasons"])
+        assert any(x == "F10_LEDGER_BIND_MISMATCH:counterfactual" for x in result["reasons"])
+    return True
+
+
+@case("F10-B null/null rehashed digest artifacts are invalid")
+def t_f10_b_null_digest():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        null_f10 = lambda d: d["fields"]["F10"].update(global_cpu_rng_sha256=None)
+        dp = _rewrite_digest(man["parent_state_digest"]["path"], null_f10, "f10-b-p.json")
+        dc = _rewrite_digest(man["child_state_digest"]["path"], null_f10, "f10-b-c.json")
+        result = sc.validate_pair(fp, cp,
+                                  tu.make_manifest((fp, cp), (dp, dc),
+                                                   ("run-F-fix", "run-C-fix")))
+        assert {"F10_DIGEST_NULL:factual", "F10_DIGEST_NULL:counterfactual"} <= set(result["reasons"])
+    return True
+
+
+@case("F10-C factual binding cannot mask counterfactual binding mismatch")
+def t_f10_c_one_side_bind():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        dc = _rewrite_digest(man["child_state_digest"]["path"],
+                             lambda d: d["fields"]["F10"].update(
+                                 global_cpu_rng_sha256="c" * 64), "f10-c.json")
+        result = sc.validate_pair(fp, cp, tu.make_manifest(
+            (fp, cp), (man["parent_state_digest"]["path"], dc),
+            ("run-F-fix", "run-C-fix")))
+        assert "F10_LEDGER_BIND_MISMATCH:counterfactual" in result["reasons"]
+        assert "F10_LEDGER_BIND_MISMATCH:factual" not in result["reasons"]
+    return True
+
+
+@case("F10-D both valid equal loaded digest bindings pass")
+def t_f10_d_loaded_pass():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        assert sc.is_pass(sc.validate_pair(fp, cp, man))
+    return True
+
+
+@case("F10-E internally consistent forged per-branch digests still disagree")
+def t_f10_e_forged_disagree():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        forged = "e" * 64
+        dp = _rewrite_digest(man["parent_state_digest"]["path"],
+                              lambda d: d["fields"]["F10"].update(
+                                  global_cpu_rng_sha256=forged), "f10-e-p.json")
+        dc = _rewrite_digest(man["child_state_digest"]["path"],
+                              lambda d: d["fields"]["F10"].update(
+                                  global_cpu_rng_sha256=forged), "f10-e-c.json")
+        result = sc.validate_pair(fp, cp, tu.make_manifest(
+            (fp, cp), (dp, dc), ("run-F-fix", "run-C-fix")))
+        assert not sc.is_pass(result)
+        assert {"F10_LEDGER_BIND_MISMATCH:factual",
+                "F10_LEDGER_BIND_MISMATCH:counterfactual"} <= set(result["reasons"])
+    return True
+
+
+@case("F12-D1..D6 loaded main-generator semantics are enforced")
+def t_f12_loaded_semantics():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        cases = [
+            ("missing", lambda d: d["fields"].pop("F12"), "F12_DIGEST_MISSING:counterfactual"),
+            ("no-main", lambda d: d["fields"]["F12"]["generators"].pop("main"), "F12_MAIN_MISSING:counterfactual"),
+            ("aux-only", lambda d: d["fields"]["F12"].update(generators={"aux": {"status": "OK", "sha256": "a" * 64, "nbytes": 1}}), "F12_MAIN_MISSING:counterfactual"),
+            ("status", lambda d: d["fields"]["F12"]["generators"]["main"].update(status="MISSING"), "F12_MAIN_STATUS_INVALID:counterfactual"),
+            ("sha-empty", lambda d: d["fields"]["F12"]["generators"]["main"].update(sha256=""), "F12_MAIN_SHA256_INVALID:counterfactual"),
+            ("sha-garbage", lambda d: d["fields"]["F12"]["generators"]["main"].update(sha256="garbage"), "F12_MAIN_SHA256_INVALID:counterfactual"),
+        ]
+        for name, mutate, reason in cases:
+            dc = _rewrite_digest(man["child_state_digest"]["path"], mutate,
+                                 "f12-%s.json" % name)
+            result = sc.validate_pair(fp, cp, tu.make_manifest(
+                (fp, cp), (man["parent_state_digest"]["path"], dc),
+                ("run-F-fix", "run-C-fix")))
+            assert reason in result["reasons"], (name, result["reasons"])
+        assert sc.is_pass(sc.validate_pair(fp, cp, man))
+    return True
+
+
+@case("JSONL scalar values are caught as LEDGER_PARSE_ERROR")
+def t_jsonl_scalar_parse():
+    with tempfile.TemporaryDirectory() as td:
+        _fp, cp, man = tu.standard_pair(td)
+        for scalar in ("42", "null", "[]", "[\"x\"]", "\"hello\"", "true"):
+            result = sc.validate_pair(scalar, cp, man)
+            assert result["status"] == sc.STRICT_COUPLING_INVALID
+            assert any(x.startswith("LEDGER_PARSE_ERROR:") for x in result["reasons"])
+    return True
+
+
+@case("F08 decode-dump index is excluded from the causal digest")
+def t_f08_decode_dump_excluded():
+    root_a = tu.make_mock_root()
+    root_b = copy.deepcopy(root_a)
+    root_a["_decode_dump_idx"] = 1
+    root_b["_decode_dump_idx"] = 999
+    a = fsd.capture(root_a, tu.make_generators())
+    b = fsd.capture(root_b, tu.make_generators())
+    assert a["fields"]["F08"]["group_sha256"] == b["fields"]["F08"]["group_sha256"]
+    return True
+
+
+@case("GPU-01 prelaunch guard enforces literal archive binding before model load")
+def t_gpu01_prelaunch():
+    class Cudnn:
+        benchmark = True
+        deterministic = False
+    class Torch:
+        backends = type("Backends", (), {"cudnn": Cudnn()})()
+    patch = os.path.abspath(os.path.join(HERE, os.pardir, "patches",
+                                         "evoke-74d26851-strict-coupling.patch"))
+    profile = os.path.abspath(os.path.join(HERE, os.pardir, "profiles",
+                                           "sc1_strict_profile.json"))
+    manifest = {"launch_strict": True, "pair_id": "pair-gpu01",
+                "run_ids": {"factual": "fresh-f", "counterfactual": "fresh-c"},
+                "patch_sha256": gp.file_sha256(patch),
+                "profile_sha256": gp.file_sha256(profile),
+                "common_config_sha256": "f" * 64}
+    env = {"EVOKE_STRICT_LAUNCH": "1", "EVOKE_WARP_SEED": "1",
+           "EVOKE_STRICT_BASE_SEED": "2",
+           "EVOKE_STRICT_PATCH_SHA256": manifest["patch_sha256"],
+           "EVOKE_STRICT_PROFILE_SHA256": manifest["profile_sha256"]}
+    common = dict(experiment_id="GPU-01", proposal_id="GPU-01",
+                  pin_resolver=lambda _: gp.PIN,
+                  flash_probe=lambda: {"status": "PASS"}, torch_module=Torch(),
+                  fingerprint=lambda **kw: {"schema": "mock", **kw},
+                  run_id_is_fresh=lambda *_: True)
+    report = gp.validate_prelaunch(manifest, patch, profile, "unused", env=env, **common)
+    assert report["status"] == gp.GPU01_PRELAUNCH_PASS and \
+        report["fingerprint"]["cudnn"] == {"benchmark": False, "deterministic": True}
+    for invalid in ("missing", False, None, "true", 1):
+        probe = dict(manifest)
+        if invalid == "missing":
+            probe.pop("launch_strict")
+        else:
+            probe["launch_strict"] = invalid
+        refused = gp.validate_prelaunch(probe, patch, profile, "unused", env=env, **common)
+        assert refused["status"] == gp.GPU01_PRELAUNCH_REFUSED
+    env_failure = gp.validate_prelaunch(
+        manifest, patch, profile, "unused", env=env,
+        flash_probe=lambda: {"status": gp.ENV_BRINGUP_FAILURE}, **{
+            k: v for k, v in common.items() if k != "flash_probe"})
+    assert env_failure["status"] == gp.ENV_BRINGUP_FAILURE
+    assert sc.refuse_gpu_countersign(dict(manifest, status=sc.STRICT_NOISE_COUPLED)) is False
+    return True
+
+
+@case("strict engine process records resolved cuDNN flags in ledger meta")
+def t_strict_engine_cudnn_meta():
+    global sf
+    sf = _load_sf()
+    sf.reset_for_tests()
+    keys = (sf.ENV_LEDGER, sf.ENV_RUN_ID, sf.ENV_LAUNCH_STRICT)
+    old = {key: os.environ.get(key) for key in keys}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            os.environ[sf.ENV_LEDGER] = os.path.join(td, "cudnn.jsonl")
+            os.environ[sf.ENV_RUN_ID] = "run-cudnn-meta"
+            os.environ[sf.ENV_LAUNCH_STRICT] = "1"
+            sf.log_draw("R1", _t().zeros(1), generator=_t().Generator().manual_seed(1))
+            ledger = os.path.join(td, "cudnn.run-cudnn-meta.jsonl")
+            meta = next(obj for obj in lines_of(ledger) if obj.get("event") == "meta")
+            assert meta["cudnn"] == {"benchmark": False, "deterministic": True}
+            sf.reset_for_tests()  # Close the Windows ledger handle before cleanup.
+    finally:
+        sf.reset_for_tests()
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     return True
 
 

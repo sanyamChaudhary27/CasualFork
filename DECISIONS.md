@@ -67,3 +67,13 @@ Record decisions, not brainstorming. Every entry must state what evidence would 
 **Evidence:** `fanin/2026-08-25-semantics/final-micro-round-review-record.md`; sealed M `ses_fc17fc901ffeoe1YiwtRx33NH8` and G `ses_fc17fc815ffeJ7x34dt22DaV48`; direct code inspection above.
 
 **Reverse if:** a CPU fix binds non-null digest F10 to each ledger's at-fork F10 meta, regression-tests the equal-null-digest attack, closes the reviewer-recorded parser/F12/F08/launcher issues as applicable, and a fresh sealed dual delta review returns `PATCH_READY_GPU01_READY`.
+
+## D009 — Continue withholding GPU-01 after validator/guard review (2026-08-26)
+
+**Decision:** Do not countersign or execute GPU-01 after the F10/F12/parser/F08 correction. The proposal remains `PATCH_INCOMPLETE` / NOT EXECUTED.
+
+**Why:** two fresh sealed reviewers independently confirmed that `harness/gpu01_prelaunch.py` is bypassable as a standalone CLI and that it does not attest a computed resolved configuration to `EVOKE_STRICT_CONFIG_SHA256` and the archived pair manifest. These are concrete, CPU-resolvable launch-policy defects, not hypothetical polish.
+
+**Evidence:** `fanin/2026-08-25-semantics/final-validator-launch-guard-review-record.md`; M `ses_fc15e1004ffe4q6DX3kwDkbJtg`; G `ses_fc15dff71ffeIxhGF6Tr0jkmhS`; current primary code cited there.
+
+**Reverse if:** one small mandatory launch wrapper archive-binds a passing prelaunch artifact and canonical resolved config identity, negative tests prove guard-bypass/stale-config rejection, and a fresh sealed two-reviewer delta review returns `PATCH_READY_GPU01_READY`.

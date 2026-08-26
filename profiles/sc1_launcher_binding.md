@@ -36,7 +36,8 @@ the validator fails the pair otherwise (`META_MISMATCH:common_config_sha256`).
 
 Set `launch_strict: true` in the pair manifest OR export
 `EVOKE_STRICT_LAUNCH=1`. Archive GPU-01 pair manifests MUST record the literal
-`"launch_strict": true`; missing, `false`, or `null` is refused by
+JSON boolean `"launch_strict": true`; missing, `false`, `null`, string
+`"true"`, and integer `1` are refused by `harness/gpu01_prelaunch.py` and
 `refuse_gpu_countersign()`. Routine local `TEST_MODE_ONLY` fixtures may omit it.
 Effect (validator): literal `UNDECLARED` — or the
 local-CPU marker `TEST_MODE_ONLY` — in ANY of `patch_sha256`,
@@ -47,7 +48,24 @@ mandatory pair-manifest ledger-artifact bindings:
 `artifacts.factual_log.sha256` and `artifacts.counterfactual_log.sha256`
 (checked for EVERY pair since this round; see `PAIR_MANIFEST_ARTIFACT*`).
 
-## 3. TEST_MODE_ONLY and GPU countersigning
+## 3. GPU-01 prelaunch guard
+
+Run `python harness/gpu01_prelaunch.py` before importing EVOKE or constructing
+a model. It writes one JSON artifact whose status is exactly
+`GPU01_PRELAUNCH_PASS`, `ENV_BRINGUP_FAILURE`, or `GPU01_PRELAUNCH_REFUSED`.
+The guard requires experiment and proposal IDs `GPU-01`, the exact pinned
+EVOKE revision, literal archive strictness, hash equality between supplied
+patch/profile files, launcher env, and manifest identities, non-marker SHA-256
+identities, `EVOKE_STRICT_LAUNCH=1`, nonempty `EVOKE_WARP_SEED` and
+`EVOKE_STRICT_BASE_SEED`, and a nonempty pair id with distinct fresh run ids.
+It runs the flash-attn probe, then sets cuDNN `benchmark=False` and
+`deterministic=True`, and records the resolved flags in the environment
+fingerprint before any hypothetical model load. These are deterministic-mode
+hints, not a claim of full CUDA bit determinism. The patched strict process
+reapplies and emits the same resolved `cudnn` evidence because launcher-process
+flags cannot persist across an external process boundary.
+
+## 4. TEST_MODE_ONLY and GPU countersigning
 
 A CPU box without diffusers may set `EVOKE_TEST_MODE_ONLY=1`; the emitter meta
 then records `diffusers="TEST_MODE_ONLY"` instead of `"UNDECLARED"`. Such
@@ -58,7 +76,7 @@ carries `UNDECLARED` or `TEST_MODE_ONLY`, or the result already carries
 countersigned for GPU-01**; GPU-01 evidence must come from launch-strict runs
 with real identity hashes.
 
-## 4. Strict CPU RNG policy (condition B)
+## 5. Strict CPU RNG policy (condition B)
 
 Upstream never seeds the DEFAULT CPU generator; two OS processes diverge.
 Under StrictCoupling only, at the FIRST fork-hook invocation (= rollout start:
@@ -80,8 +98,11 @@ never touched. Recorded per run: meta `strict_cpu_rng_policy`,
 `strict_cpu_rng_seed`, `cpu_rng_sha256_after_init`, `cpu_rng_sha256_at_fork`;
 the FORK_CAPTURE sidecar mirrors the block. The validator fails asymmetric
 evidence (`META_MISMATCH:strict_cpu_rng_*`) and F10 boundary-digest inequality.
+Each loaded parent/child digest must independently carry a non-null SHA-256 F10
+value equal to that branch ledger's `cpu_rng_sha256_at_fork`; equality only
+between digest artifacts is insufficient.
 
-## 5. Live-state adapter (condition 1)
+## 6. Live-state adapter (condition 1)
 
 The patched `__call__` hunk builds an EPHEMERAL NON-OWNING `LiveStateView`
 (`build_live_state_view(history_latents, total_generated_latent_frames,
@@ -98,7 +119,7 @@ to the fork hook. F-id -> live source map (audited pin line numbers):
 | F05 | geo_da3_bank._pt_mask | da3_cloud.py:606 | DA3FrameBank instance | REQ |
 | F06 | geo_da3_bank._probation/_carve_strike/_win_hist/_pinned_wins | da3_cloud.py:530/:557/:598/:597 | DA3FrameBank instance | REQ |
 | F07 | _geo_persist_feat_map / _geo_persist_feat_map_conv_idx | self._geo_persist_feat_map pipeline_evoke.py:467/:473/:516/:3044; conv idx = vae._conv_idx :474/:502/:507 | pipeline-persistent between chunks | REQ |
-| F08 | counters_set | da3_cloud.py:538 (_ingest_calls) /:599 (_sr_ingests) /:600 (_sr_last) /:577 (_ca_seen); pipeline_evoke.py:457-464 (_decode_dump_idx, 0 while env off) | live counters, snapshotted into a scalar dict at build | REQ |
+| F08 | counters_set | da3_cloud.py:538 (_ingest_calls) /:599 (_sr_ingests) /:600 (_sr_last) /:577 (_ca_seen) | live counters, snapshotted into a scalar dict at build | REQ |
 | F09 | estimator_stream_digest | ViGeo stream scalars vigeo_cloud.py:340 (_scale_locked)/:152+:338 (_anchor_scales); kv-cache `_kv` EXCLUDED (F15). sha256 over canonical JSON of {class,_scale_locked,n_anchor_scales,process_res} | computed read-only at build | ADVISORY |
 | F10 | global_cpu_rng_sha256 (+ meta policy block) | torch default CPU generator state; seeded per section 4 | process-global | REQ |
 | F11 | _geo_cfg_mirror_K_pix/_stride/_lag | geo_state["da3_K_pix"]:724 / ["da3_pix_stride"]:725 / ["da3_lag"]:730 | geo_state dict | REQ |
@@ -111,9 +132,11 @@ Residual honesty note: `restrict_self_attn` and `invisible_history_noise` are
 not visible inside `__call__` scope; they remain PREFLIGHT-side assertions
 (sc1_preflight.FORBIDDEN_RULES), not F14 entries.
 
-`_short_tier_print_count` is intentionally excluded from F08. Source audit
-finds it serves progress/logging only, with no generation-state consumer; it
-cannot establish or break causal boundary equivalence.
+`_short_tier_print_count` and `_decode_dump_idx` are intentionally excluded
+from F08. Pin `pipeline_evoke.py:457-464` reads/increments `_decode_dump_idx`
+only under `EVOKE_SAVE_DECODE_LATENTS` to name a `torch.save` dump and print a
+line; no generation consumer exists. Neither logging counter can establish or
+break causal boundary equivalence.
 
 ## 7. cuDNN and flash-attn bring-up
 
@@ -126,7 +149,7 @@ Run `python harness/flash_attn_preflight.py` before importing/loading any model.
 An import or version failure reports `ENV_BRINGUP_FAILURE`; it is an environment
 bring-up failure, never an SC1 coupling verdict.
 
-## 6. Lazy-meta continuation rewrite (condition 4/E)
+## 8. Lazy-meta continuation rewrite (condition 4/E)
 
 `_patch_meta_continuation` no longer swallows failures: any error emits a
 `{"event":"META_PATCH_FAILURE", ...}` ledger line, clears the module flag, and

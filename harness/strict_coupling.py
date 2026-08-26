@@ -134,6 +134,9 @@ def load_log(source):
             obj = json.loads(line)
         except Exception as exc:
             raise ValueError("parse error at line %d: %s" % (lineno, exc))
+        if not isinstance(obj, dict):
+            raise ValueError("parse error at line %d: JSON value must be an object"
+                             % lineno)
         event = obj.get("event")
         if event == "meta":
             metas.append(obj)
@@ -247,6 +250,68 @@ def _artifact_sha(spec):
     if path and h is None:
         h = file_sha256(path)
     return path, h
+
+
+def _is_sha256(value):
+    return isinstance(value, str) and len(value) == 64 and \
+        all(ch in "0123456789abcdefABCDEF" for ch in value)
+
+
+def validate_loaded_boundary_digest(manifest, ledger_meta, role):
+    """Validate the loaded digest's F10/F12 evidence for one branch.
+
+    ``role`` is the corresponding factual/counterfactual ledger role; ledger_meta
+    is that run's header. This intentionally validates each
+    artifact before the cross-artifact comparison so equal forged values cannot
+    stand in for per-run boundary evidence.
+    """
+    reasons = []
+    fields = manifest.get("fields") if isinstance(manifest, dict) else None
+    if not isinstance(fields, dict):
+        return ["F10_DIGEST_MISSING:%s" % role,
+                "F12_DIGEST_MISSING:%s" % role]
+
+    f10 = fields.get("F10")
+    if not isinstance(f10, dict) or "global_cpu_rng_sha256" not in f10:
+        reasons.append("F10_DIGEST_MISSING:%s" % role)
+    else:
+        digest_sha = f10.get("global_cpu_rng_sha256")
+        if digest_sha is None:
+            reasons.append("F10_DIGEST_NULL:%s" % role)
+        elif not _is_sha256(digest_sha):
+            reasons.append("F10_DIGEST_INVALID:%s" % role)
+        else:
+            ledger_sha = ledger_meta.get("cpu_rng_sha256_at_fork") \
+                if isinstance(ledger_meta, dict) else None
+            if ledger_sha is None:
+                reasons.append("F10_LEDGER_MISSING:%s" % role)
+            elif not _is_sha256(ledger_sha):
+                reasons.append("F10_LEDGER_INVALID:%s" % role)
+            elif digest_sha != ledger_sha:
+                reasons.append("F10_LEDGER_BIND_MISMATCH:%s" % role)
+
+    f12 = fields.get("F12")
+    if not isinstance(f12, dict):
+        reasons.append("F12_DIGEST_MISSING:%s" % role)
+    else:
+        generators = f12.get("generators")
+        if not isinstance(generators, dict):
+            reasons.append("F12_GENERATORS_MISSING:%s" % role)
+        elif "main" not in generators:
+            reasons.append("F12_MAIN_MISSING:%s" % role)
+        else:
+            main = generators["main"]
+            if not isinstance(main, dict):
+                reasons.append("F12_MAIN_INVALID:%s" % role)
+            else:
+                if main.get("status") != "OK":
+                    reasons.append("F12_MAIN_STATUS_INVALID:%s" % role)
+                if not _is_sha256(main.get("sha256")):
+                    reasons.append("F12_MAIN_SHA256_INVALID:%s" % role)
+                nbytes = main.get("nbytes")
+                if isinstance(nbytes, bool) or not isinstance(nbytes, int) or nbytes <= 0:
+                    reasons.append("F12_MAIN_NBYTES_INVALID:%s" % role)
+    return reasons
 
 
 # ------------------------------------------------------------- main entry ----
@@ -407,7 +472,7 @@ def validate_pair(factual_log, cf_log, pair_manifest,
                            % (sfield, sv, cv_))
 
     # -- launch-strict identity gate (condition 3/D) ---------------------------
-    launch_strict = bool(m.get("launch_strict")) or \
+    launch_strict = m.get("launch_strict") is True or \
         os.environ.get(ENV_LAUNCH_STRICT, "") == "1"
     if launch_strict:
         for role_key, meta_r in ((factual_role, fm), (cf_role, cm)):
@@ -586,6 +651,10 @@ def validate_pair(factual_log, cf_log, pair_manifest,
             import fork_state_digest as fsd
             man = fsd.load(path)
             loaded_digests[side] = man
+            ledger_meta = fm if side == "parent" else cm
+            ledger_role = factual_role if side == "parent" else cf_role
+            reasons.extend(validate_loaded_boundary_digest(man, ledger_meta,
+                                                            ledger_role))
             if man.get("missing_required_paths"):
                 reasons.append("STATE_DIGEST_MISSING_REQUIRED:%s %s"
                                % (side, man["missing_required_paths"]))

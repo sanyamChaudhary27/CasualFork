@@ -160,6 +160,9 @@ def build_branch(role="factual", run_id="run-x", chunks=3, fork_chunk=1,
             counters["R6"] -= 1
 
     continuation = GENERATOR_STATE_RESTORED if role == "counterfactual" else None
+    import torch
+    f10_sha = hashlib.sha256(torch.get_rng_state().contiguous().reshape(
+        -1).numpy().tobytes()).hexdigest()
     meta = {
         "event": "meta", "pin": PIN, "patch": PATCH_ID,
         "patch_sha256": PATCH_SHA, "profile_sha256": PROFILE_SHA,
@@ -170,8 +173,8 @@ def build_branch(role="factual", run_id="run-x", chunks=3, fork_chunk=1,
         "continuation": continuation, "env_fork_present": True,
         "strict_cpu_rng_policy": "causalfork/sc1-strict-cpu-rng@1",
         "strict_cpu_rng_seed": 20260826,
-        "cpu_rng_sha256_after_init": "f10-after-init-test",
-        "cpu_rng_sha256_at_fork": "f10-at-fork-test",
+        "cpu_rng_sha256_after_init": f10_sha,
+        "cpu_rng_sha256_at_fork": f10_sha,
     }
     return meta, entries, events
 
@@ -314,7 +317,6 @@ def make_mock_root(seed=1234, real_banks=True):
         "counters_set": {
             "da3_bank__ingest_calls": 42, "da3_bank__sr_ingests": 0,
             "da3_bank__sr_last": -10 ** 9, "da3_bank__ca_seen": 0,
-            "pipeline__decode_dump_idx": 0,
         },
         # F07 persistent VAE feature cache + conv idx mirror
         "_geo_persist_feat_map": t(1, 8, 4, 6, 10),
