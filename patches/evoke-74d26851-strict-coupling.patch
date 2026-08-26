@@ -45,15 +45,17 @@ index 4ebc620..33245ff 100644
      def covis_vec(rows, tpose):
          """the fraction of source g's subsampled points that fall inside the target frustum (same implementation as single_primary)."""
 diff --git a/evoke/pipelines/pipeline_evoke.py b/evoke/pipelines/pipeline_evoke.py
-index 5d77a43..ddac6aa 100644
+index 5d77a43..ddd9522 100644
 --- a/evoke/pipelines/pipeline_evoke.py
 +++ b/evoke/pipelines/pipeline_evoke.py
-@@ -33,6 +33,16 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+@@ -33,6 +33,18 @@ from diffusers.pipelines.pipeline_utils import DiffusionPipeline
  from diffusers.schedulers import UniPCMultistepScheduler
  from diffusers.utils import is_ftfy_available, is_torch_xla_available, logging, replace_example_docstring
  from diffusers.utils.torch_utils import randn_tensor
 +from ..strict_fork import (
++    build_live_state_view as _sf_build_live_state_view,
 +    collect_generators as _sf_collect_generators,
++    fork_mode_active as _sf_fork_active,
 +    gen_state_of as _sf_gen_state,
 +    log_draw as _sf_log_draw,
 +    maybe_fork_boundary as _sf_maybe_fork_boundary,
@@ -65,7 +67,7 @@ index 5d77a43..ddac6aa 100644
  from diffusers.video_processor import VideoProcessor
  
  from ..modules.transformer_evoke import EvokeTransformer3DModel
-@@ -368,7 +378,9 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
+@@ -368,7 +380,9 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
                  f" size of {batch_size}. Make sure the batch size matches the length of the generators."
              )
  
@@ -75,7 +77,7 @@ index 5d77a43..ddac6aa 100644
          return latents
  
      def prepare_image_latents(
-@@ -421,7 +433,10 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
+@@ -421,7 +435,10 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
              start_frame = num_frames - total_valid_frames
  
              first_frame = video[:, :, 0:1, :, :]
@@ -86,7 +88,7 @@ index 5d77a43..ddac6aa 100644
              first_frame_latent = (first_frame_latent - latents_mean) * latents_std
  
              latents_chunks = []
-@@ -429,7 +444,10 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
+@@ -429,7 +446,10 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
                  chunk_start = start_frame + i * min_frames
                  chunk_end = chunk_start + min_frames
                  video_chunk = video[:, :, chunk_start:chunk_end, :, :]
@@ -97,7 +99,7 @@ index 5d77a43..ddac6aa 100644
                  chunk_latents = (chunk_latents - latents_mean) * latents_std
                  latents_chunks.insert(0, chunk_latents)
              latents = torch.cat(latents_chunks, dim=2)
-@@ -570,7 +588,9 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
+@@ -570,7 +590,9 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
  
          L = torch.linalg.cholesky(cov)
          block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
@@ -107,7 +109,7 @@ index 5d77a43..ddac6aa 100644
          noise = z @ L.T
  
          noise = noise.view(batch_size, channel, num_frames, height // ph, width // pw, ph, pw)
-@@ -973,9 +993,11 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
+@@ -973,9 +995,11 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
              )
          chunk_frames = int(warp_latents.shape[2])
          rand_generator = generator[0] if isinstance(generator, list) else generator
@@ -119,7 +121,7 @@ index 5d77a43..ddac6aa 100644
  
          if visibility_aware_noise and visibility_mask_pix is not None:
              # Spatial-sigma path: pool pixel mask to latent domain and broadcast per-pixel sigma.
-@@ -993,7 +1015,9 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
+@@ -993,7 +1017,9 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
              ).to(dtype=warp_latents.dtype)
              sigma_visible_5d = frame_sigmas.view(1, 1, chunk_frames, 1, 1)
              sigmas = mask_lat * sigma_visible_5d + (1.0 - mask_lat) * float(sigma_invisible)
@@ -129,7 +131,7 @@ index 5d77a43..ddac6aa 100644
              return sigmas * noise + (1.0 - sigmas) * warp_latents
          else:
              # Frame-uniform sigma (default path).
-@@ -1440,6 +1464,7 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
+@@ -1440,6 +1466,7 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
  
          i = 0
          for i_s in range(stage2_num_stages):
@@ -137,7 +139,7 @@ index 5d77a43..ddac6aa 100644
              # Fuse GEO LoRA only at stage 0; unfuse at higher pyramid stages.
              if geo_lora_active and i_s == 0:
                  if not self._fuse_geo_lora():
-@@ -2365,6 +2390,13 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
+@@ -2365,6 +2392,34 @@ class EvokePipeline(DiffusionPipeline, WanLoraLoaderMixin):
              _chunk_iter = _prog_bar
  
          for k in _chunk_iter:
@@ -146,23 +148,45 @@ index 5d77a43..ddac6aa 100644
 +            # [CausalFork SC1] TRUE fork boundary: TOP of the chunk loop - BEFORE prompt
 +            # selection (:2413), warp render (:2617) / encode (:2628), prepare_latents (:2791):
 +            # zero post-fork stochastic draws can precede capture/restore. No-op unless
-+            # EVOKE_STRICT_FORK_JSON is set.
-+            _sf_maybe_fork_boundary(int(k), _sf_collect_generators(generator, getattr(self, "_geo_patchdrop_gen", None)), self)
++            # EVOKE_STRICT_FORK_JSON is set. The EPHEMERAL NON-OWNING LiveStateView is
++            # constructed FIRST (gated to StrictCoupling-active) from THIS iteration's
++            # locals: history_latents / total_generated_latent_frames were last updated
++            # by the PREVIOUS chunk iteration (:3019-3020), so the view reflects the
++            # POST-PREFIX state at the true boundary; it is passed to the hook instead
++            # of the raw pipeline. Observational-only: references live objects, never
++            # clones, never mutates, no new persistent aliases on self.
++            _sf_view = self
++            if _sf_fork_active():
++                _sf_view = _sf_build_live_state_view(
++                    history_latents, total_generated_latent_frames, geo_state, self,
++                    chunk_index=int(k), event_set_size=len(_event_set),
++                    forced_off_flags={
++                        "use_kv_cache": bool(use_kv_cache),
++                        "use_cfg_zero_star": bool(use_cfg_zero_star),
++                        "use_dmd": bool(use_dmd),
++                        "use_adaptive_anti_drifting": bool(use_adaptive_anti_drifting),
++                        "use_interpolate_prompt": bool(use_interpolate_prompt),
++                        "geo_disable_prev_short": bool(geo_disable_prev_short),
++                        "is_keep_x0": bool(is_keep_x0),
++                        "short_tier_noise_enabled": bool((getattr(self, "_short_tier_noise_cfg", None) or {}).get("enabled", False)),
++                    })
++            _sf_maybe_fork_boundary(int(k), _sf_collect_generators(generator, getattr(self, "_geo_patchdrop_gen", None)), _sf_view)
              _t_chunk0 = _ptime.time()
              _t_warp_s = None      # None = phase did not run for this chunk (t2v, or warp disabled)
              _t_diff_s = None
 diff --git a/evoke/strict_fork.py b/evoke/strict_fork.py
 new file mode 100644
-index 0000000..f9a4d22
+index 0000000..3d332c6
 --- /dev/null
 +++ b/evoke/strict_fork.py
-@@ -0,0 +1,794 @@
-+"""CausalFork SC1 strict-coupling instrumentation V2.
+@@ -0,0 +1,1156 @@
++"""CausalFork SC1 strict-coupling instrumentation V2 (+ FINAL CPU ROUND adapter).
 +
-+ADDED BY PATCH evoke-74d26851-strict-coupling (STAGE-B/C fix round) on top of
-+AlayaLab/Evoke @ 74d268516d95c8fceadd2378f91a73f9f187042b. Everything here is
-+env-gated: when no gate env var is set, instrumented call sites reduce to cheap
-+early-returns and upstream behaviour (including RNG streams) is unchanged.
++ADDED BY PATCH evoke-74d26851-strict-coupling (STAGE-B/C fix round + FINAL CPU
++ROUND 2026-08-26) on top of AlayaLab/Evoke @ 74d268516d95c8fceadd2378f91a73f9f187042b.
++Everything here is env-gated: when no gate env var is set, instrumented call
++sites reduce to cheap early-returns and upstream behaviour (including RNG
++streams) is unchanged.
 +
 +Gates
 +-----
@@ -182,19 +206,36 @@ index 0000000..f9a4d22
 +                            The hook runs at the TOP of each chunk loop iteration
 +                            (pipeline_evoke.py, `for k in _chunk_iter`), i.e.
 +                            BEFORE prompt selection, warp render and ANY
-+                            post-fork stochastic draw.
++                            post-fork stochastic draw. The hook receives an
++                            EPHEMERAL NON-OWNING LiveStateView built from the
++                            __call__ locals/geo_state AT THE TRUE CHUNK BOUNDARY
++                            (see build_live_state_view) - never the raw
++                            pipeline. Construction itself is gated to
++                            StrictCoupling-active (_sf_fork_active()).
 +                            capture: generator snapshot (.pt + sha256 sidecar)
-+                            PLUS FORK_STATE_DIGEST v1 (fields F01-F14, harness/
-+                            fork_state_digest.py spec) written NEXT TO the
-+                            capture as fork_state_digest_chunk<C>.json.
++                            PLUS FORK_STATE_DIGEST v1 (canonical F01-F14,
++                            harness/fork_state_digest.py spec) written NEXT TO
++                            the capture as fork_state_digest_chunk<C>.json.
 +                            restore: replayed branch re-captures its boundary
 +                            state and compares BEFORE any chunk-C draw; any
 +                            REQUIRED-field mismatch aborts the run loudly
 +                            (FORK_STATE_MISMATCH ledger line + RuntimeError).
 +EVOKE_STRICT_PATCH_SHA256 / EVOKE_STRICT_PROFILE_SHA256 /
-+EVOKE_STRICT_CONFIG_SHA256  launch-time identity declarations; copied into the
-+                            ledger meta so the validator can bind logs to the
-+                            audited patch/profile/config triple.
++EVOKE_STRICT_CONFIG_SHA256  launch-time identity declarations exported by the
++                            launcher (see profiles/sc1_launcher_binding.md);
++                            literal "UNDECLARED" is ILLEGAL in launch-strict
++                            validation -> INVALID(IDENTITY_UNDECLARED).
++EVOKE_STRICT_CONFIG_SHA_ENGINE  optional engine-side RESOLVED-config sha (from
++                            preflight canonical_config over resolved argv),
++                            copied into meta.engine_resolved_config_sha256 when
++                            available; advisory identity evidence.
++EVOKE_STRICT_BASE_SEED      launcher-exported resolved --seed; input to the
++                            strict CPU RNG derivation (condition B).
++EVOKE_TEST_MODE_ONLY        local-CPU-only marker: when diffusers is absent AND
++                            this is "1", meta.diffusers records the explicit
++                            marker TEST_MODE_ONLY instead of UNDECLARED. Such
++                            ledgers can NEVER receive a GPU countersignature
++                            (validator refuse_gpu_countersign hard-refuses).
 +
 +Site emission contract (adjudication 2026-08-25):
 +  R2/R3  extra carries sha256_input_pixels / sha256_mean / sha256_std
@@ -203,6 +244,32 @@ index 0000000..f9a4d22
 +         high=wp.shape[0], skip_flag; empty-domain gids emit skip rows; index
 +         tensors are witness-only and never compared post-divergence by the
 +         validator.
++
++F10 DEFAULT CPU RNG POLICY (condition B)
++----------------------------------------
++Upstream never seeds the DEFAULT CPU generator; separate OS processes diverge.
++Under StrictCoupling ONLY (fork_cfg active), the FIRST fork-hook invocation -
++which under the frozen profile IS the rollout start, because the hook fires at
++the TOP of chunk iteration 0 before prompt selection/warp render/ANY R-site
++draw and every audited stochastic site uses an explicit generator (7 sites,
++profiles/sc1_strict_profile.json; short-tier/sigma-lock/anti-drift/patchdrop/
++DMD consumers are all forced off) - deterministically initializes the DEFAULT
++CPU generator:
++
++    strict_cpu_rng_seed =
++        int( sha256( "causalfork/sc1-strict-cpu-rng@1|pin=<pin>|base_seed=<bs>|"
++                     "fork_chunk=<c>|pair_id=<pid>" ).hexdigest()[:16], 16 )
++
++    cpu_gen = torch.Generator(device="cpu"); cpu_gen.manual_seed(seed)
++    torch.set_rng_state(cpu_gen.get_state())   # CPU default RNG ONLY
++
++base_seed comes from EVOKE_STRICT_BASE_SEED (launcher exports the resolved
++--seed); the literal fallback "UNSET" keeps two processes equal iff both unset
++(any asymmetry surfaces as META_MISMATCH:strict_cpu_rng_seed). The derivation
++excludes branch identity so factual and CF replay processes initialize
++identically. CUDA global RNG and managed Generators are NEVER touched (no
++torch.cuda.*, no torch.manual_seed, no Generator.set_state on main streams);
++test RNG3 proves the main generator bytes are unchanged.
 +
 +NoiseTape.record backs the ledger; NoiseTape.replay remains a PHASE-2 FALLBACK
 +stub (raises NotImplementedError).
@@ -229,28 +296,37 @@ index 0000000..f9a4d22
 +ENV_PATCH_SHA = "EVOKE_STRICT_PATCH_SHA256"
 +ENV_PROFILE_SHA = "EVOKE_STRICT_PROFILE_SHA256"
 +ENV_CONFIG_SHA = "EVOKE_STRICT_CONFIG_SHA256"
++ENV_CONFIG_SHA_ENGINE = "EVOKE_STRICT_CONFIG_SHA_ENGINE"
++ENV_BASE_SEED = "EVOKE_STRICT_BASE_SEED"
++ENV_TEST_MODE_ONLY = "EVOKE_TEST_MODE_ONLY"
 +
 +CONTINUATION_MARKER = "GENERATOR_STATE_RESTORED"
++META_PATCH_FAILURE_EVENT = "META_PATCH_FAILURE"
++STRICT_CPU_RNG_POLICY = ("causalfork/sc1-strict-cpu-rng@1|sha256(pin|base_seed|"
++                         "fork_chunk|pair_id)[:16 hex] -> uint64 manual_seed")
 +
 +DIGEST_SCHEMA = "causalfork/fork-state-digest@1"
 +EXCLUDED_NOTE = "F15 kv-cache/scheduler/_cgen/print counters excluded by ruling"
 +ADVISORY_FIELDS = ("F09",)
-+# (field_id, required, [dotted attribute paths]) - MUST mirror
-+# harness/fork_state_digest.py FIELD_SPEC byte-for-byte.
++# (field_id, required, [dotted attribute paths relative to the LiveStateView])
++# CANONICAL NUMBERING - MUST mirror harness/fork_state_digest.py FIELD_SPEC
++# byte-for-byte (enforced by tests DG/DG2).
 +STATE_DIGEST_FIELD_SPEC = [
 +    ("F01", True, ("history_latents", "history_latent_counter")),
 +    ("F02", True, ("prev_frame_pix", "prev_frame_latent")),
 +    ("F03", True, ("geo_frame_bank",)),
 +    ("F04", True, ("geo_da3_bank.pts", "geo_da3_bank.c2ws",
-+                   "geo_da3_bank.frames", "geo_da3_bank._pt_mask")),
-+    ("F05", True, ("geo_da3_bank._probation", "geo_da3_bank._carve_strike")),
-+    ("F06", True, ("counters_set",)),
++                   "geo_da3_bank.frames")),
++    ("F05", True, ("geo_da3_bank._pt_mask",)),
++    ("F06", True, ("geo_da3_bank._probation", "geo_da3_bank._carve_strike",
++                   "geo_da3_bank._win_hist", "geo_da3_bank._pinned_wins")),
 +    ("F07", True, ("_geo_persist_feat_map", "_geo_persist_feat_map_conv_idx")),
-+    ("F08", True, ("_geo_cfg_mirror_K_pix", "_geo_cfg_mirror_stride",
-+                   "_geo_cfg_mirror_lag")),
++    ("F08", True, ("counters_set",)),
 +    ("F09", False, ("estimator_stream_digest",)),
-+    ("F11", True, ("_geo_source_image_sha", "_geo_anchor_c2w_assert",
-+                   "_geo_i2v_flag_assert", "event_set_empty_assert")),
++    ("F11", True, ("_geo_cfg_mirror_K_pix", "_geo_cfg_mirror_stride",
++                   "_geo_cfg_mirror_lag")),
++    ("F13", True, ("_geo_source_image_sha", "_geo_i2v_flag_assert",
++                   "_geo_anchor_pix_idx_assert", "event_set_empty_assert")),
 +    ("F14", True, ("_geo_forced_off_flags",)),
 +]
 +
@@ -265,6 +341,9 @@ index 0000000..f9a4d22
 +_RESTORED = None
 +_RENDER_CALL = {"n": 0}
 +_RUN_CACHE = {}
++# condition B / condition E module state
++_STRICT_CPU_RNG = None            # evidence dict or None
++_META_CONTINUATION_VERIFIED = None   # None=never attempted, True/False
 +
 +
 +def get_branch_id():
@@ -335,6 +414,12 @@ index 0000000..f9a4d22
 +    return _FORK_CFG
 +
 +
++def fork_mode_active():
++    """True ONLY when the fork-boundary hook will actually act (StrictCoupling
++    active). Gates the LiveStateView construction in the patched __call__."""
++    return fork_cfg() is not None
++
++
 +def active():
 +    return ledger_enabled() or fork_cfg() is not None
 +
@@ -396,8 +481,6 @@ index 0000000..f9a4d22
 +        }
 +    except Exception:
 +        return {}
-+
-+
 +class NoiseTape:
 +    """Ordered record of instrumented draws; backs the JSONL ledger."""
 +
@@ -478,7 +561,65 @@ index 0000000..f9a4d22
 +        import diffusers
 +        return str(getattr(diffusers, "__version__", "unknown"))
 +    except Exception:
++        if os.environ.get(ENV_TEST_MODE_ONLY, "") == "1":
++            return "TEST_MODE_ONLY"   # explicit local-CPU marker, never GPU-valid
 +        return "UNDECLARED"
++
++
++def _safe_meta_int(cfg):
++    """fork_chunk from the fork JSON; never raises on garbage (meta stays
++    honest: malformed input records None and lets the validator complain)."""
++    try:
++        return int(cfg["fork_chunk"]) if cfg and "fork_chunk" in cfg else None
++    except Exception:
++        return None
++
++
++def strict_cpu_rng_record():
++    """Evidence block for meta/sidecars (or None when policy never ran)."""
++    return dict(_STRICT_CPU_RNG) if _STRICT_CPU_RNG else None
++
++
++def derive_strict_cpu_seed(base_seed, fork_chunk, pair_identity,
++                           pin=PATCH_TARGET_PIN):
++    """Documented derivation (condition B): sha256 over run-identity inputs
++    WITHOUT branch identity; 64-bit slice (first 16 hex chars) of the digest."""
++    payload = ("causalfork/sc1-strict-cpu-rng@1|pin=%s|base_seed=%s|"
++               "fork_chunk=%s|pair_id=%s" % (pin, base_seed, fork_chunk,
++                                             pair_identity))
++    return int(hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16], 16)
++
++
++def ensure_strict_cpu_rng(cfg, chunk_index):
++    """Initialize the DEFAULT CPU generator deterministically ONCE per process
++    at the FIRST fork-hook invocation (== rollout start under the frozen
++    profile; see module docstring). CPU-only: touches torch.set_rng_state and
++    nothing else - no CUDA RNG, no managed Generator."""
++    global _STRICT_CPU_RNG
++    if _STRICT_CPU_RNG is not None:
++        return _STRICT_CPU_RNG
++    base_seed = os.environ.get(ENV_BASE_SEED, "UNSET")
++    fc = _safe_meta_int(cfg)
++    seed64 = derive_strict_cpu_seed(base_seed, fc, pair_id())
++    cpu_gen = torch.Generator(device="cpu")
++    cpu_gen.manual_seed(seed64)
++    torch.set_rng_state(cpu_gen.get_state())
++    # Hash the default-CPU state DIRECTLY (not via global_rng_digest, whose
++    # active() gate depends on unrelated ledger env vars).
++    _post = hashlib.sha256(torch.get_rng_state().contiguous().reshape(
++        -1).numpy().tobytes()).hexdigest()
++    _STRICT_CPU_RNG = {
++        "policy": STRICT_CPU_RNG_POLICY,
++        "seed": seed64,
++        "cpu_rng_sha256_after_init": _post,
++        "cpu_rng_sha256_at_fork": None,       # filled at the boundary itself
++        "initialized_at_chunk": int(chunk_index),
++        "base_seed_declared": base_seed != "UNSET",
++    }
++    print("[StrictFork] default CPU RNG deterministically initialized "
++          "(policy=sc1-strict-cpu-rng@1 seed=%d chunk=%s)"
++          % (seed64, chunk_index), flush=True)
++    return _STRICT_CPU_RNG
 +
 +
 +def _ensure_meta_line():
@@ -486,6 +627,7 @@ index 0000000..f9a4d22
 +    if _META_WRITTEN:
 +        return
 +    cfg = fork_cfg()
++    rng_rec = strict_cpu_rng_record() or {}
 +    meta = {
 +        "event": "meta",
 +        "pin": PATCH_TARGET_PIN,
@@ -493,8 +635,9 @@ index 0000000..f9a4d22
 +        "patch_sha256": os.environ.get(ENV_PATCH_SHA) or "UNDECLARED",
 +        "profile_sha256": os.environ.get(ENV_PROFILE_SHA) or "UNDECLARED",
 +        "common_config_sha256": os.environ.get(ENV_CONFIG_SHA) or "UNDECLARED",
-+        "fork_chunk": (int(cfg["fork_chunk"]) if cfg and "fork_chunk" in cfg
-+                       else None),
++        "engine_resolved_config_sha256":
++            os.environ.get(ENV_CONFIG_SHA_ENGINE) or "UNDECLARED",
++        "fork_chunk": _safe_meta_int(cfg),
 +        "branch_id": get_branch_id(),
 +        "run_id": run_id(),
 +        "pair_id": pair_id(),
@@ -503,6 +646,12 @@ index 0000000..f9a4d22
 +        "warp_seed": _warp_seed_record(),
 +        "continuation": _RESTORED,
 +        "env_fork_present": os.environ.get(ENV_FORK) is not None,
++        "launch_strict_env": os.environ.get("EVOKE_STRICT_LAUNCH", "") == "1",
++        "strict_cpu_rng_policy": STRICT_CPU_RNG_POLICY,
++        "strict_cpu_rng_seed": rng_rec.get("seed"),
++        "cpu_rng_sha256_after_init": rng_rec.get("cpu_rng_sha256_after_init"),
++        "cpu_rng_sha256_at_fork": rng_rec.get("cpu_rng_sha256_at_fork"),
++        "meta_continuation_verified": _META_CONTINUATION_VERIFIED,
 +    }
 +    _LEDGER_FH.write(json.dumps(meta, sort_keys=True) + "\n")
 +    _LEDGER_FH.flush()
@@ -557,6 +706,179 @@ index 0000000..f9a4d22
 +    return out
 +
 +
++# ------------------------------------------------------------- live view ----
++def _estimator_stream_digest(est):
++    """F09 ADVISORY digest over the estimator NON-kv stream state.
++
++    Audited live sources: ViGeoDepthEstimator._scale_locked
++    (vigeo_cloud.py:340), ._anchor_scales (vigeo_cloud.py:152/:338),
++    process_res (constructor arg). The kv-cache (`._kv`) is DELIBERATELY
++    EXCLUDED - F15 class per adjudication. DA3DepthEstimator carries no
++    cross-window stream state (stateless class, da3_cloud.py:119-125).
++    Formula: sha256 over sorted-key canonical JSON of the small scalar dict.
++    """
++    if est is None:
++        return None
++    info = {"class": type(est).__name__}
++    sl = getattr(est, "_scale_locked", "ABSENT")
++    info["_scale_locked"] = None if sl is None else float(sl)
++    anch = getattr(est, "_anchor_scales", None)
++    info["n_anchor_scales"] = len(anch) if isinstance(anch, (list, tuple)) else None
++    pr = getattr(est, "process_res", None)
++    info["process_res"] = int(pr) if pr is not None else None
++    return sha256_bytes(json.dumps(info, sort_keys=True).encode("utf-8"))
++
++
++def _require_key(gs, key):
++    """geo_state-keyed mappings are LOUD: an absent key raises AttributeError
++    so the digest records an honest MISSING (never a silent fake value);
++    present-but-None stays a legitimate digestable value (early-chunk state)."""
++    if isinstance(gs, dict) and key not in gs:
++        raise AttributeError(key)
++    return gs.get(key)
++
++
++_LIVE_VIEW_RESOLVERS = {
++    # F01 - function-local rolling latent buffer + exact counter equivalent.
++    # Sources: pipeline_evoke.py:2299 creation, :2502-2504/:2738/:3019-3021
++    # consumption; counter total_generated_latent_frames :2140/:2310/:2319/:3019.
++    "history_latents": lambda r: r["hs"],
++    "history_latent_counter": lambda r: r["hc"],
++    # F02 - geo_state["prev_chunk_last_frame"] :3088 (init :592),
++    #       ["prev_chunk_last_decoded_latent"] :2211 init / :3125 update.
++    "prev_frame_pix": lambda r: _require_key(r["gs"], "prev_chunk_last_frame"),
++    "prev_frame_latent": lambda r: _require_key(r["gs"],
++                                                "prev_chunk_last_decoded_latent"),
++    # F03 - Pi3X FrameBank, geo_state["frame_bank"] :587-591/:2245/:3118.
++    "geo_frame_bank": lambda r: _require_key(r["gs"], "frame_bank"),
++    # F04/F05/F06 - DA3FrameBank, geo_state["da3_bank"] :633; attribute names
++    # audited at da3_cloud.py:601(pts)/:602(c2ws)/:603(frames)/:606(_pt_mask)/
++    # :530(_probation)/:557(_carve_strike)/:598(_win_hist)/:597(_pinned_wins).
++    "geo_da3_bank": lambda r: _require_key(r["gs"], "da3_bank"),
++    # F07 - pipeline-persistent decoder feature cache :467/:473/:516/:3044;
++    # conv-index mirror lives on the VAE (vae._conv_idx :474/:502/:507).
++    # Both legitimately None until the first persistent decode -> digested as
++    # values (N:), divergence still caught by cross-branch comparison.
++    "_geo_persist_feat_map": lambda r: getattr(r["pipe"], "_geo_persist_feat_map",
++                                               None),
++    "_geo_persist_feat_map_conv_idx": lambda r: getattr(
++        getattr(r["pipe"], "vae", None), "_conv_idx", None),
++    # F08 - audited counters: da3_cloud.py:538(_ingest_calls)/:599(_sr_ingests)/
++    # :600(_sr_last)/:577(_ca_seen); pipeline_evoke.py:2328+:2716(print count)/
++    # :457-464(decode dump idx; 0 while EVOKE_SAVE_DECODE_LATENTS unset).
++    "counters_set": lambda r: {
++        "da3_bank__ingest_calls": getattr(r["gs"].get("da3_bank"),
++                                          "_ingest_calls", None),
++        "da3_bank__sr_ingests": getattr(r["gs"].get("da3_bank"),
++                                        "_sr_ingests", None),
++        "da3_bank__sr_last": getattr(r["gs"].get("da3_bank"), "_sr_last", None),
++        "da3_bank__ca_seen": getattr(r["gs"].get("da3_bank"), "_ca_seen", None),
++        "pipeline__short_tier_print_count": getattr(r["pipe"],
++                                                    "_short_tier_print_count",
++                                                    None),
++        "pipeline__decode_dump_idx": getattr(r["pipe"], "_decode_dump_idx",
++                                             None),
++    },
++    # F09 - ADVISORY stream digest (kv-cache excluded, F15 class).
++    "estimator_stream_digest": lambda r: _estimator_stream_digest(
++        r["gs"].get("da3_est")),
++    # F11 - config mirrors: geo_state["da3_K_pix"]:724 / ["da3_pix_stride"]:725 /
++    # ["da3_lag"]:730.
++    "_geo_cfg_mirror_K_pix": lambda r: _require_key(r["gs"], "da3_K_pix"),
++    "_geo_cfg_mirror_stride": lambda r: _require_key(r["gs"], "da3_pix_stride"),
++    "_geo_cfg_mirror_lag": lambda r: _require_key(r["gs"], "da3_lag"),
++    # F13 - config assertions from audited live sources:
++    #   source_image_pixel :590/:2231 (sha256 at build time, read-only);
++    #   da3_is_i2v :2289; v2v_chunk0_anchor_pix_idx :2232;
++    #   event_set emptiness from len(_event_set) (:2002), passed by the patched
++    #   hunk (camera cursor is k+event_set-derived -> config assertion, not
++    #   state - adjudication "Additional facts frozen").
++    "_geo_source_image_sha": lambda r: (
++        tensor_sha256(_require_key(r["gs"], "source_image_pixel"))
++        if r["gs"].get("source_image_pixel") is not None else None),
++    "_geo_i2v_flag_assert": lambda r: _require_key(r["gs"], "da3_is_i2v"),
++    "_geo_anchor_pix_idx_assert": lambda r: _require_key(
++        r["gs"], "v2v_chunk0_anchor_pix_idx"),
++    "event_set_empty_assert": lambda r: (
++        None if r["evs"] is None else (int(r["evs"]) == 0)),
++    # F14 - forced-off flags captured from __call__ locals by the patched hunk
++    # (use_kv_cache :1825, use_cfg_zero_star :1780, use_dmd :1784,
++    # use_adaptive_anti_drifting :1788, use_interpolate_prompt :1765,
++    # geo_disable_prev_short :1798, is_keep_x0 :1773,
++    # self._short_tier_noise_cfg.enabled). restrict_self_attn /
++    # invisible_history_noise live outside __call__ scope and stay asserted
++    # PREFLIGHT-side - documented residual, profiles/sc1_launcher_binding.md.
++    "_geo_forced_off_flags": lambda r: dict(r["fof"] or {}),
++}
++
++
++class LiveStateView(object):
++    """EPHEMERAL NON-OWNING observation window over the engine's live
++    fork-boundary state. Constructed AT THE TRUE CHUNK BOUNDARY (top of the
++    chunk-loop hunk) and handed to maybe_fork_boundary instead of the raw
++    pipeline.
++
++    OBSERVATIONAL-ONLY contract:
++      * attributes RESOLVE LIVE through _LIVE_VIEW_RESOLVERS against the
++        caller's locals / geo_state / pipeline - tensors and banks are
++        referenced, never cloned (digesting performs its own unavoidable CPU
++        byte copies at hash time);
++      * zero mutation of engine semantics; no new persistent aliases stored on
++        the pipeline; the only synthesized objects are tiny scalar dicts
++        (counters/config mirrors/digest strings);
++      * read-only: attribute assignment raises AttributeError;
++      * construction is gated to StrictCoupling-active in the patched hunk.
++    """
++
++    def __init__(self, history_latents, history_latent_counter, geo_state,
++                 pipeline, chunk_index=None, event_set_size=None,
++                 forced_off_flags=None):
++        if geo_state is None:
++            raise ValueError(
++                "[StrictFork] build_live_state_view requires the live geo_state "
++                "dict; StrictCoupling cannot certify a fork boundary without "
++                "the geometric-state fields (F03-F06).")
++        object.__setattr__(self, "_refs", {
++            "hs": history_latents,
++            "hc": history_latent_counter,
++            "gs": geo_state,
++            "pipe": pipeline,
++            "k": chunk_index,
++            "evs": event_set_size,
++            "fof": forced_off_flags,
++        })
++
++    @property
++    def refs(self):
++        """Read-only copy of the reference table (tests/audit only)."""
++        return dict(object.__getattribute__(self, "_refs"))
++
++    def __getattr__(self, name):
++        refs = object.__getattribute__(self, "_refs")
++        resolver = _LIVE_VIEW_RESOLVERS.get(name)
++        if resolver is None:
++            raise AttributeError(name)
++        return resolver(refs)
++
++    def __setattr__(self, name, value):
++        raise AttributeError("[StrictFork] LiveStateView is observational-only "
++                             "(read-only); refusing to set %r" % (name,))
++
++
++def build_live_state_view(history_latents, total_generated_latent_frames,
++                          geo_state, pipeline, chunk_index=None,
++                          event_set_size=None, forced_off_flags=None):
++    """Build the ephemeral non-owning state view handed to the fork hook.
++
++    Called from the patched __call__ hunk at the TOP of the chunk loop where
++    `history_latents` / `total_generated_latent_frames` hold exactly the values
++    left by the PREVIOUS chunk iteration (:3019-3020) - i.e. the view reflects
++    post-prefix state at the true boundary.
++    """
++    return LiveStateView(history_latents, total_generated_latent_frames,
++                         geo_state, pipeline, chunk_index=chunk_index,
++                         event_set_size=event_set_size,
++                         forced_off_flags=forced_off_flags)
 +# ------------------------------------------------------------------ digest --
 +def _resolve_attr(root, dotted):
 +    cur = root
@@ -645,13 +967,13 @@ index 0000000..f9a4d22
 +            st = g.get_state().contiguous().reshape(-1).numpy().tobytes()
 +            gens[name] = {"status": "OK", "sha256": _sha_of_raw(st),
 +                          "nbytes": len(st)}
++    fields["F12"] = {"required": True, "generators": gens}
 +    try:
 +        gst = torch.get_rng_state().contiguous().reshape(-1).numpy().tobytes()
 +        global_cpu = _sha_of_raw(gst)
 +    except Exception:
 +        global_cpu = None
-+    fields["F10"] = {"required": True, "generators": gens,
-+                     "global_cpu_rng_sha256": global_cpu}
++    fields["F10"] = {"required": True, "global_cpu_rng_sha256": global_cpu}
 +    manifest = {
 +        "schema": DIGEST_SCHEMA,
 +        "pin": PATCH_TARGET_PIN,
@@ -739,7 +1061,22 @@ index 0000000..f9a4d22
 +def _patch_meta_continuation():
 +    """Lazy-meta repair: the meta header is written at first ledger use,
 +    before restore status is knowable. Once a restore succeeds, rewrite the
-+    header's continuation field so validator META checks reflect reality."""
++    header's continuation field so validator META checks reflect reality.
++
++    SINGLE-WRITER TRUNCATE-ON-CRASH WINDOW (documented): this rewrite truncates
++    the ledger file (open(path, "w")) and rewrites every buffered line from
++    memory in ONE writelines call. A process crash BETWEEN truncation and
++    completion loses all lines after the header. Accepted because the
++    unique-ledger-per-run policy makes this process the ONLY writer (no
++    interleaving possible); the window is bounded by one writelines call.
++
++    The silent except-pass of the previous revision is REMOVED: on ANY failure
++    the module flag _META_CONTINUATION_VERIFIED goes False, a structured
++    {"event": "META_PATCH_FAILURE", ...} ledger line is emitted (best effort,
++    lock-free append), and RuntimeError re-raises so STRICT CERTIFICATION
++    ABORTS loudly. The validator turns that marker into INVALID
++    (META_CONTINUATION_UNVERIFIED)."""
++    global _META_CONTINUATION_VERIFIED
 +    if _LEDGER_FH is None or not getattr(_LEDGER_FH, "name", None):
 +        return
 +    path = _LEDGER_OPENED or _LEDGER_FH.name
@@ -753,6 +1090,7 @@ index 0000000..f9a4d22
 +        if head.get("event") != "meta":
 +            return
 +        if head.get("continuation") == CONTINUATION_MARKER:
++            _META_CONTINUATION_VERIFIED = True
 +            return
 +        head["continuation"] = CONTINUATION_MARKER
 +        lines[0] = json.dumps(head, sort_keys=True) + "\n"
@@ -760,17 +1098,43 @@ index 0000000..f9a4d22
 +        with open(path, "w", encoding="utf-8", newline="\n") as fh:
 +            fh.writelines(lines)
 +        globals()["_LEDGER_FH"] = open(path, "a", encoding="utf-8", newline="\n")
-+    except (ValueError, OSError):
-+        pass
++        _META_CONTINUATION_VERIFIED = True
++    except (ValueError, OSError, RuntimeError) as exc:
++        _META_CONTINUATION_VERIFIED = False
++        try:
++            with open(path, "a", encoding="utf-8", newline="\n") as fh:
++                fh.write(json.dumps({
++                    "event": META_PATCH_FAILURE_EVENT,
++                    "error": "%s: %s" % (type(exc).__name__, exc),
++                    "path": path,
++                    "run_id": run_id(), "pair_id": pair_id(),
++                    "branch_id": get_branch_id(),
++                }, sort_keys=True) + "\n")
++        except Exception:
++            pass   # even the marker could not be written; the raised error
++                   # below still aborts - certification cannot proceed on an
++                   # unverifiable ledger.
++        raise RuntimeError(
++            "[StrictFork] meta continuation rewrite FAILED (%r); strict "
++            "certification aborts (META_CONTINUATION_UNVERIFIED)" % (exc,))
++
++
++def continuation_verified():
++    """Expose the lazy-meta rewrite status for in-process assertions."""
++    return _META_CONTINUATION_VERIFIED
 +
 +
 +def maybe_fork_boundary(chunk_index, generators, pipeline=None):
 +    """TRUE fork boundary hook: called at the TOP of every chunk iteration;
 +    acts only at cfg.fork_chunk, before prompt selection / warp render / ANY
-+    post-fork stochastic draw."""
++    post-fork stochastic draw. `pipeline` is the ephemeral LiveStateView built
++    by the patched hunk (observational-only), never the raw pipeline."""
 +    cfg = fork_cfg()
 +    if cfg is None:
 +        return None
++    # Condition B: FIRST hook invocation == deterministic CPU-RNG rollout
++    # start (before any draw; equivalence argument in the module docstring).
++    ensure_strict_cpu_rng(cfg, chunk_index)
 +    if int(cfg.get("fork_chunk", -(10 ** 9))) != int(chunk_index):
 +        return None
 +    mode = str(cfg.get("mode", "capture")).lower()
@@ -788,7 +1152,16 @@ index 0000000..f9a4d22
 +    if pipeline is None:
 +        raise ValueError("[StrictFork] capture mode requires the pipeline "
 +                         "object (FORK_STATE_DIGEST is REQUIRED)")
++    if not isinstance(pipeline, LiveStateView):
++        raise ValueError(
++            "[StrictFork] capture requires the EPHEMERAL LiveStateView built "
++            "by build_live_state_view at the true chunk boundary (got %s); "
++            "raw pipelines are rejected so the digest provably reads boundary "
++            "state, not stale attributes." % type(pipeline).__name__)
 +    os.makedirs(out_dir, exist_ok=True)
++    if _STRICT_CPU_RNG is not None and _STRICT_CPU_RNG.get(
++            "cpu_rng_sha256_at_fork") is None:
++        _STRICT_CPU_RNG["cpu_rng_sha256_at_fork"] = global_rng_digest()
 +    gens_json = {}
 +    for name in sorted(generators):
 +        g = generators[name]
@@ -809,6 +1182,8 @@ index 0000000..f9a4d22
 +        "generators": gens_json,
 +        "warp_seed": _warp_seed_record(),
 +        "global_rng_sha256": global_rng_digest(),
++        "strict_cpu_rng": strict_cpu_rng_record(),
++        "state_view": {"kind": "LiveStateView", "observational_only": True},
 +        "torch": torch.__version__,
 +        "created_utc": _utcnow(),
 +    }
@@ -847,6 +1222,11 @@ index 0000000..f9a4d22
 +    if pipeline is None:
 +        raise ValueError("[StrictFork] restore mode requires the pipeline "
 +                         "object (FORK_STATE_DIGEST comparison is REQUIRED)")
++    if not isinstance(pipeline, LiveStateView):
++        raise ValueError(
++            "[StrictFork] restore requires the EPHEMERAL LiveStateView built "
++            "by build_live_state_view at the true chunk boundary (got %s)."
++            % type(pipeline).__name__)
 +    with open(side, "r", encoding="utf-8") as fh:
 +        meta = json.load(fh)
 +    if meta.get("kind") != "EVOKE_STRICT_FORK_CAPTURE":
@@ -900,6 +1280,9 @@ index 0000000..f9a4d22
 +        })
 +        raise RuntimeError("[StrictFork] FORK_STATE_MISMATCH at chunk %d: %s"
 +                           % (chunk_index, json.dumps(detail, sort_keys=True)))
++    if _STRICT_CPU_RNG is not None and _STRICT_CPU_RNG.get(
++            "cpu_rng_sha256_at_fork") is None:
++        _STRICT_CPU_RNG["cpu_rng_sha256_at_fork"] = global_rng_digest()
 +    global _RESTORED
 +    with _LOCK:
 +        _RESTORED = CONTINUATION_MARKER
@@ -932,7 +1315,7 @@ index 0000000..f9a4d22
 +def reset_for_tests():
 +    """Isolate module state between unit tests (not used on the engine path)."""
 +    global _FORK_CFG, _FORK_CFG_RAW, _LEDGER_FH, _META_WRITTEN, _RESTORED, \
-+        _LEDGER_OPENED, _SEQ
++        _LEDGER_OPENED, _SEQ, _STRICT_CPU_RNG, _META_CONTINUATION_VERIFIED
 +    with _LOCK:
 +        _ORDINALS.clear()
 +        _SEQ["n"] = 0
@@ -951,6 +1334,8 @@ index 0000000..f9a4d22
 +        _TAPE.entries.clear()
 +        _RENDER_CALL["n"] = 0
 +        _RUN_CACHE.clear()
++        _STRICT_CPU_RNG = None
++        _META_CONTINUATION_VERIFIED = None
 
 [stderr]
 warning: in the working copy of 'sc1-p1/.gitignore', LF will be replaced by CRLF the next time Git touches it

@@ -519,6 +519,15 @@ def _t():
     return _TORCH
 
 
+def _live_view(fix, k):
+    """Build the REAL emitter LiveStateView from an engine-like fixture."""
+    gs, pipe, loc = fix
+    return sf.build_live_state_view(
+        loc["history_latents"], loc["total_generated_latent_frames"],
+        gs, pipe, chunk_index=k, event_set_size=loc["event_set_size"],
+        forced_off_flags=loc["forced_off_flags"])
+
+
 def _iso_gen():
     seed = int(hashlib.sha256(b"7777").hexdigest()[:15], 16)
     return _t().Generator().manual_seed(seed)
@@ -573,6 +582,7 @@ def _mock_chunk_draws(sf, k, main, iso, pix):
 @case("O LIVE end-to-end: capture->restore->validator PASS; restore precedes "
       "every R-site draw at fork chunk (target-5 proof)")
 def t_o():
+    global sf
     sf = _load_sf()
     sf.reset_for_tests()
     old_env = {k: os.environ.get(k) for k in (
@@ -594,14 +604,15 @@ def t_o():
             os.environ[sf.ENV_BRANCH] = "factual"
             os.environ[sf.ENV_RUN_ID] = "run-O-f"
             os.environ[sf.ENV_LEDGER] = f_base
-            root_p = tu.make_mock_root(seed=1000)
+            fix_p = tu.make_engine_like_fixture(seed=1000)
             main = _t().Generator().manual_seed(20260826)
             iso = _iso_gen()
             cfg_cap = {"fork_chunk": 1, "mode": "capture", "out_dir": cap_dir}
             os.environ[sf.ENV_FORK] = json.dumps(cfg_cap)
             pix = _t().zeros(1, 3, 33, 48, 80)
             for k in range(3):
-                sf.maybe_fork_boundary(k, {"main": main}, pipeline=root_p)
+                sf.maybe_fork_boundary(k, {"main": main},
+                                       pipeline=_live_view(fix_p, k))
                 _mock_chunk_draws(sf, k, main, iso, pix)
             sf.reset_for_tests()
 
@@ -614,14 +625,15 @@ def t_o():
             os.environ[sf.ENV_BRANCH] = "counterfactual"
             os.environ[sf.ENV_RUN_ID] = "run-O-c"
             os.environ[sf.ENV_LEDGER] = c_base
-            root_c = tu.make_mock_root(seed=1000)   # identical boundary state
+            fix_c = tu.make_engine_like_fixture(seed=1000)  # identical boundary
             main2 = _t().Generator().manual_seed(20260826)
             iso2 = _iso_gen()
             cfg_res = {"fork_chunk": 1, "mode": "restore", "sidecar": sidecar,
                        "parent_state_digest": parent_digest}
             os.environ[sf.ENV_FORK] = json.dumps(cfg_res)
             for k in range(3):
-                sf.maybe_fork_boundary(k, {"main": main2}, pipeline=root_c)
+                sf.maybe_fork_boundary(k, {"main": main2},
+                                       pipeline=_live_view(fix_c, k))
                 _mock_chunk_draws(sf, k, main2, iso2, pix)
             sf.reset_for_tests()
 
@@ -688,7 +700,8 @@ def t_bn():
             if "_sf_" not in seg or isinstance(node, ast.Module):
                 continue
             ok_kind = isinstance(node, (ast.Call, ast.Assign, ast.Expr,
-                                        ast.For, ast.Name, ast.Attribute))
+                                        ast.For, ast.If, ast.Name,
+                                        ast.Attribute))
             if ok_kind:
                 checked += 1
             elif hasattr(ast, "unparse"):
@@ -711,6 +724,8 @@ def t_bn():
                      s.startswith("_sf_rcall =") or
                      s.startswith("_sf_log_draw(") or
                      s.startswith("_sf_maybe_fork_boundary(") or
+                     s.startswith("_sf_view = ") or
+                     s.startswith("if _sf_fork_active():") or
                      s.startswith("_sf_set_") or
                      s.startswith("from ...strict_fork") or
                      s.startswith("from ..strict_fork") or
@@ -772,6 +787,416 @@ def t_p():
     md_prof = open(path.replace(".json", ".md"), encoding="utf-8").read()
     assert "rollout/prompt chunk stride** is 36 pixel frames" in md_prof
     assert "chunk-index based" in md_prof
+    return True
+
+
+# =========================================================== FINAL CPU ROUND ==
+@case("V1 LIVE adapter: realistic view (real banks) -> digest COMPLETE")
+def t_v1():
+    global sf
+    sf = _load_sf()
+    sf.reset_for_tests()
+    fix = tu.make_engine_like_fixture(seed=555)
+    gs, pipe, loc = fix
+    view = _live_view(fix, 1)
+    # observational-only: mapped tensors are LIVE references (same storage)
+    assert view.history_latents is loc["history_latents"]
+    assert view.prev_frame_pix is gs["prev_chunk_last_frame"]
+    assert view.geo_da3_bank is gs["da3_bank"]
+    try:
+        view.history_latents = None
+        raise AssertionError("LiveStateView must be read-only")
+    except AttributeError:
+        pass
+    m = sf.capture_fork_state_digest(view, {"main": _t().Generator().manual_seed(3)},
+                                     fork_chunk=1, branch_id="factual")
+    assert m.get("missing_required_paths") is None, \
+        m.get("missing_required_paths")
+    # harness implementation agrees field-by-field on group hashes
+    import torch
+    mh = fsd.capture(view, {"main": torch.Generator().manual_seed(3)},
+                     fork_chunk=1, branch_id="factual")
+    for fid in ("F01", "F02", "F03", "F04", "F05", "F06", "F07", "F08",
+                "F11", "F13", "F14"):
+        assert mh["fields"][fid]["group_sha256"] == \
+            m["fields"][fid]["group_sha256"], fid
+    print("      [v1] real banks: %s / %s"
+          % (type(gs["frame_bank"]).__name__, type(gs["da3_bank"]).__name__))
+    sf.reset_for_tests()
+    return True
+
+
+@case("V2 adapter: deleting a REQUIRED mapped field fails LOUDLY (never silent)")
+def t_v2():
+    global sf
+    sf = _load_sf()
+    sf.reset_for_tests()
+    fix = tu.make_engine_like_fixture(seed=777)
+    gs, pipe, loc = fix
+    del gs["prev_chunk_last_frame"]          # sabotage one mapping source
+    view = _live_view(fix, 1)
+    m = sf.capture_fork_state_digest(view, {"main": None}, fork_chunk=1,
+                                     branch_id="factual")
+    assert m.get("missing_required_paths") == ["prev_frame_pix"], \
+        m.get("missing_required_paths")
+    assert m["fields"]["F02"]["paths"]["prev_frame_pix"]["status"] == "MISSING"
+    # harness-side digest reports the same loud miss
+    mh = fsd.capture(view, {"main": None}, fork_chunk=1, branch_id="cf")
+    assert mh.get("missing_required_paths") == ["prev_frame_pix"]
+    # and the capture HOOK aborts the run loudly on such state
+    import torch as _t2
+    os.environ[sf.ENV_FORK] = json.dumps({"fork_chunk": 1, "mode": "capture",
+                                          "out_dir": os.path.join(
+                                              tempfile.gettempdir(),
+                                              "sc1-v2-negout")})
+    try:
+        sf.maybe_fork_boundary(1, {"main": _t2.Generator().manual_seed(1)},
+                               pipeline=view)
+        raise AssertionError("REQUIRED-missing boundary must abort loudly")
+    except RuntimeError as exc:
+        assert "missing REQUIRED fields" in str(exc) and \
+            "prev_frame_pix" in str(exc)
+    finally:
+        os.environ.pop(sf.ENV_FORK, None)
+        sf.reset_for_tests()
+    return True
+
+
+@case("RNG1 strict CPU RNG: two fresh process-equivalent inits agree at fork")
+def t_rng1():
+    global sf
+    sf = _load_sf()
+
+    def fresh_init():
+        sf.reset_for_tests()
+        old = {k: os.environ.get(k) for k in (sf.ENV_BASE_SEED, sf.ENV_PAIR_ID)}
+        os.environ[sf.ENV_BASE_SEED] = "123456"
+        os.environ[sf.ENV_PAIR_ID] = tu.PAIR_ID
+        try:
+            cfg = {"fork_chunk": 1, "mode": "capture", "out_dir": "x"}
+            rec = sf.ensure_strict_cpu_rng(cfg, 0)
+            return rec, rec["cpu_rng_sha256_after_init"]
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    rec_a, sha_a = fresh_init()
+    rec_b, sha_b = fresh_init()
+    assert rec_a["seed"] == rec_b["seed"] and sha_a == sha_b
+    assert sha_a == hashlib.sha256(
+        __import__("torch").get_rng_state().contiguous().reshape(-1).numpy()
+        .tobytes()).hexdigest()
+    # derivation excludes branch identity: same inputs -> same seed
+    assert sf.derive_strict_cpu_seed("1", 2, "p") == \
+        sf.derive_strict_cpu_seed("1", 2, "p")
+    assert sf.derive_strict_cpu_seed("1", 2, "p") != \
+        sf.derive_strict_cpu_seed("2", 2, "p")
+    sf.reset_for_tests()
+    return True
+
+
+@case("RNG2 different derived seed -> F10 CPU-RNG mismatch caught by VALIDATOR")
+def t_rng2():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        # rebuild the CHILD state digest under a DIFFERENT default-CPU stream
+        root = tu.make_mock_root()
+        gens = tu.make_generators()
+        _t().rand(4)                       # perturb the default CPU generator
+        child = fsd.capture(root, gens, fork_chunk=1, branch_id="counterfactual")
+        cpath = fsd.save(child, os.path.join(td, "child_f10.json"))
+        man2 = tu.make_manifest((fp, cp), (man["parent_state_digest"]["path"],
+                                           cpath),
+                                ("run-F-fix", "run-C-fix"))
+        r = sc.validate_pair(fp, cp, man2)
+        assert not sc.is_pass(r), sc.format_result(r)
+        hits = [x for x in r["reasons"] if x.startswith("FORK_STATE_DIGEST_MISMATCH:F10")]
+        assert hits, r["reasons"][:10]
+    return True
+
+
+@case("RNG3 CPU init leaves managed generator bytes + CUDA entry points alone")
+def t_rng3():
+    sf = _load_sf()
+    sf.reset_for_tests()
+    g = _t().Generator().manual_seed(20260826)
+    s0 = bytes(g.get_state().numpy().tobytes())
+    called = {"cuda": []}
+    orig_ms, orig_msa = _t().cuda.manual_seed, _t().cuda.manual_seed_all
+
+    def _boom(name):
+        def f(*a, **k):
+            called["cuda"].append(name)
+            raise AssertionError("CUDA global RNG touched: %s" % name)
+        return f
+    _t().cuda.manual_seed = _boom("manual_seed")
+    _t().cuda.manual_seed_all = _boom("manual_seed_all")
+    try:
+        cfg = {"fork_chunk": 1}
+        sf.ensure_strict_cpu_rng(cfg, 0)
+    finally:
+        _t().cuda.manual_seed = orig_ms
+        _t().cuda.manual_seed_all = orig_msa
+    assert not called["cuda"], called
+    assert bytes(g.get_state().numpy().tobytes()) == s0, \
+        "managed main generator was mutated by the CPU init"
+    sf.reset_for_tests()
+    return True
+
+
+@case("RNG4 gates unset -> set_rng_state NEVER called (sentinel)")
+def t_rng4():
+    global sf
+    sf = _load_sf()
+    sf.reset_for_tests()
+    assert os.environ.get(sf.ENV_FORK) is None
+    orig = _t().set_rng_state
+
+    def _sentinel(*a, **k):
+        raise AssertionError("torch.set_rng_state called with gates unset")
+
+    _t().set_rng_state = _sentinel
+    try:
+        assert sf.maybe_fork_boundary(5, {}, {}) is None
+        assert sf.strict_cpu_rng_record() is None
+    finally:
+        _t().set_rng_state = orig
+    sf.reset_for_tests()
+    return True
+
+
+@case("MALICIOUS meta: fork_chunk None/garbage -> META_MISMATCH, never crash")
+def t_mal():
+    def poison(objs, val):
+        for o in objs:
+            if o.get("event") == "meta":
+                o["fork_chunk"] = val
+        return objs
+    with tempfile.TemporaryDirectory() as td:
+        for bad in (None, "garbage", [7]):
+            fp, cp, man = tu.standard_pair(td)
+            fp2 = rewrite(fp, lambda o: poison(o, bad), "mal-f.jsonl")
+            man2 = remanifest(man, fp2, cp)
+            r = sc.validate_pair(fp2, cp, man2)
+            assert not sc.is_pass(r)
+            assert any(x.startswith("META_MISMATCH:fork_chunk")
+                       for x in r["reasons"]), r["reasons"][:8]
+    return True
+
+
+def _ls_case(field, marker="UNDECLARED"):
+    def fn():
+        with tempfile.TemporaryDirectory() as td:
+            fp, cp, man = tu.standard_pair(td)
+
+            def poison(objs):
+                for o in objs:
+                    if o.get("event") == "meta":
+                        o[field] = marker
+                return objs
+            cp2 = rewrite(cp, poison, "ls.jsonl")
+            man2 = tu.make_manifest((fp, cp2),
+                                    (man["parent_state_digest"]["path"],
+                                     man["child_state_digest"]["path"]),
+                                    ("run-F-fix", "run-C-fix"),
+                                    overrides={"launch_strict": True})
+            r = sc.validate_pair(fp, cp2, man2)
+            assert not sc.is_pass(r), sc.format_result(r)
+            hits = [x for x in r["reasons"]
+                    if x.startswith("IDENTITY_UNDECLARED:%s:" % field)]
+            assert hits, r["reasons"][:10]
+            # outside launch-strict the same ledger is only refused for
+            # countersigning, not invalid outright
+            man3 = tu.make_manifest((fp, cp2),
+                                    (man["parent_state_digest"]["path"],
+                                     man["child_state_digest"]["path"]),
+                                    ("run-F-fix", "run-C-fix"))
+            assert sc.refuse_gpu_countersign(r) is True, \
+                "IDENTITY_UNDECLARED result must be refused for GPU countersign"
+            if field == "diffusers":
+                r3 = sc.validate_pair(fp, cp2, man3)
+                assert sc.is_pass(r3), sc.format_result(r3)
+        return True
+    fn.__name__ = "ls_%s_%s" % (field, marker.lower())
+    return fn
+
+
+for _f in ("patch_sha256", "profile_sha256", "common_config_sha256"):
+    globals()["t_ls_" + _f.rstrip("_sha256")] = case(
+        "LS %s UNDECLARED -> INVALID(IDENTITY_UNDECLARED) in launch-strict" % _f,
+    )(_ls_case(_f))
+t_ls_diffusers = case(
+    "LS diffusers UNDECLARED -> INVALID(IDENTITY_UNDECLARED) in launch-strict",
+)(_ls_case("diffusers"))
+
+
+@case("LS env flag EVOKE_STRICT_LAUNCH=1 activates the identity gate")
+def t_ls_env():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+
+        def poison(objs):
+            for o in objs:
+                if o.get("event") == "meta":
+                    o["patch_sha256"] = "UNDECLARED"
+            return objs
+        cp2 = rewrite(cp, poison, "lse.jsonl")
+        man2 = tu.make_manifest((fp, cp2),
+                                (man["parent_state_digest"]["path"],
+                                 man["child_state_digest"]["path"]),
+                                ("run-F-fix", "run-C-fix"))
+        old = os.environ.get(sc.ENV_LAUNCH_STRICT)
+        os.environ[sc.ENV_LAUNCH_STRICT] = "1"
+        try:
+            r = sc.validate_pair(fp, cp2, man2)
+        finally:
+            if old is None:
+                os.environ.pop(sc.ENV_LAUNCH_STRICT, None)
+            else:
+                os.environ[sc.ENV_LAUNCH_STRICT] = old
+        assert not sc.is_pass(r)
+        assert any(x.startswith("IDENTITY_UNDECLARED:patch_sha256")
+                   for x in r["reasons"]), r["reasons"][:8]
+    return True
+
+
+@case("LS manifest missing counterfactual ledger-artifact hash -> INVALID")
+def t_ls_artifact():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        man2 = copy.deepcopy(man)
+        del man2["artifacts"]["counterfactual_log"]
+        r = sc.validate_pair(fp, cp, man2)
+        assert not sc.is_pass(r)
+        assert any(x.startswith("PAIR_MANIFEST_ARTIFACTS:")
+                   for x in r["reasons"]), r["reasons"]
+        man3 = copy.deepcopy(man)
+        man3["artifacts"]["factual_log"] = {"path": man["artifacts"]["factual_log"]["path"]}
+        man3.pop("launch_strict", None)
+        r3 = sc.validate_pair(fp, cp, man3)
+        assert not sc.is_pass(r3)
+        assert any(x.startswith("PAIR_MANIFEST_ARTIFACT_SHA:factual_log")
+                   for x in r3["reasons"]), r3["reasons"]
+    return True
+
+
+@case("LS TEST_MODE_ONLY ledgers are NEVER GPU-countersignable")
+def t_ls_refuse():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+        r = sc.validate_pair(fp, cp, man)
+        assert sc.is_pass(r)
+        assert sc.refuse_gpu_countersign(r) is False      # clean pass -> allow
+        man_t = copy.deepcopy(man)
+        man_t["patch_sha256"] = "TEST_MODE_ONLY"
+        assert sc.refuse_gpu_countersign(man_t) is True
+        man_u = copy.deepcopy(man)
+        man_u["common_config_sha256"] = "UNDECLARED"
+        assert sc.refuse_gpu_countersign(man_u) is True
+
+        def mark(objs):
+            for o in objs:
+                if o.get("event") == "meta":
+                    o["diffusers"] = "TEST_MODE_ONLY"
+            return objs
+        cp2 = rewrite(cp, mark, "tmo.jsonl")
+        objs = lines_of(cp2)
+        tmo_meta = next(o for o in objs if o.get("event") == "meta")
+        assert sc.refuse_gpu_countersign({"metas": [tmo_meta]}) is True
+    return True
+
+
+@case("MPF lazy-meta rewrite failure -> META_PATCH_FAILURE event + "
+      "INVALID(META_CONTINUATION_UNVERIFIED)")
+def t_mpf():
+    global sf
+    sf = _load_sf()
+    sf.reset_for_tests()
+    old_env = {k: os.environ.get(k) for k in (
+        sf.ENV_LEDGER, sf.ENV_FORK, sf.ENV_RUN_ID, sf.ENV_PAIR_ID)}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            cap_dir = os.path.join(td, "cap")
+            base = os.path.join(td, "mpf.base.jsonl")
+            os.environ[sf.ENV_RUN_ID] = "run-MPF"
+            os.environ[sf.ENV_PAIR_ID] = tu.PAIR_ID
+            os.environ[sf.ENV_LEDGER] = base
+            fix = tu.make_engine_like_fixture(seed=42)
+            sidecar = None
+            parent_digest = None
+            cfg_cap = {"fork_chunk": 1, "mode": "capture", "out_dir": cap_dir}
+            os.environ[sf.ENV_FORK] = json.dumps(cfg_cap)
+            main = _t().Generator().manual_seed(9)
+            for k in range(2):
+                sf.maybe_fork_boundary(k, {"main": main},
+                                       pipeline=_live_view(fix, k))
+            sf.reset_for_tests()
+            parent_digest = os.path.join(cap_dir,
+                                         "fork_state_digest_chunk1.json")
+            sidecar = os.path.join(cap_dir, "fork_capture_chunk1.json")
+            os.environ[sf.ENV_RUN_ID] = "run-MPF2"
+            os.environ[sf.ENV_LEDGER] = base
+            cfg_res = {"fork_chunk": 1, "mode": "restore", "sidecar": sidecar,
+                       "parent_state_digest": parent_digest}
+            os.environ[sf.ENV_FORK] = json.dumps(cfg_res)
+            main2 = _t().Generator().manual_seed(9)
+            sf.log_draw("R1", _t().zeros(2), generator=main2,
+                        gen_before=sf.gen_state_of(main2))   # open ledger+meta
+            # force the header rewrite to fail at its read step
+            real_open = open
+            target = os.path.abspath(base.replace(".jsonl", ".run-MPF2.jsonl"))
+
+            def sabotaged(path, mode="r", *a, **k):
+                if mode == "r" and os.path.abspath(str(path)) == target:
+                    raise OSError("MPF-simulated read failure")
+                return real_open(path, mode, *a, **k)
+            import builtins
+            builtins.open, saved = sabotaged, builtins.open
+            raised = False
+            try:
+                sf.maybe_fork_boundary(1, {"main": main2},
+                                       pipeline=_live_view(fix, 1))
+            except RuntimeError as exc:
+                raised = True
+                assert "META_CONTINUATION_UNVERIFIED" in str(exc)
+            finally:
+                builtins.open = saved
+            assert raised
+            assert sf.continuation_verified() is False
+            sf.reset_for_tests()
+            mpf_path = base.replace(".jsonl", ".run-MPF2.jsonl")
+            evs = [json.loads(x) for x in open(mpf_path, encoding="utf-8")
+                   if x.strip()]
+            assert any(o.get("event") == "META_PATCH_FAILURE" and
+                       "MPF-simulated" in (o.get("error") or "")
+                       for o in evs), evs[-3:]
+    finally:
+        sf.reset_for_tests()
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    # validator-level: a META_PATCH_FAILURE marker poisons the pair
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man = tu.standard_pair(td)
+
+        def inject(objs):
+            objs.append({"event": "META_PATCH_FAILURE",
+                         "seq": 99999, "error": "simulated"})
+            return objs
+        cp2 = rewrite(cp, inject, "mpf2.jsonl")
+        man2 = tu.make_manifest((fp, cp2),
+                                (man["parent_state_digest"]["path"],
+                                 man["child_state_digest"]["path"]),
+                                ("run-F-fix", "run-C-fix"))
+        r = sc.validate_pair(fp, cp2, man2)
+        assert not sc.is_pass(r)
+        assert any(x.startswith("META_CONTINUATION_UNVERIFIED:counterfactual")
+                   for x in r["reasons"]), r["reasons"][-6:]
     return True
 
 

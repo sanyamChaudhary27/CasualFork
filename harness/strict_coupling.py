@@ -69,6 +69,22 @@ COMPARED_FIELDS = ("chunk", "stage", "shape", "dtype")
 
 R2_R3_DIAG_FIELDS = ("sha256_input_pixels", "sha256_mean", "sha256_std")
 
+# FINAL CPU ROUND additions ----------------------------------------------------
+# Identity fields whose literal "UNDECLARED"/"TEST_MODE_ONLY" values are illegal
+# once LAUNCH-STRICT mode is active (manifest flag launch_strict=true OR env
+# EVOKE_STRICT_LAUNCH=1). Such ledgers can never be GPU-countersigned either
+# (see refuse_gpu_countersign).
+IDENTITY_META_FIELDS = ("patch_sha256", "profile_sha256",
+                        "common_config_sha256", "diffusers")
+IDENTITY_MARKERS = ("UNDECLARED", "TEST_MODE_ONLY")
+ENV_LAUNCH_STRICT = "EVOKE_STRICT_LAUNCH"
+# Emitter-side lazy-meta rewrite failure marker (condition 4/E).
+META_PATCH_FAILURE = "META_PATCH_FAILURE"
+# Strict CPU RNG evidence recorded by the emitter meta (condition B); both
+# branches must carry identical values because the seed derivation excludes
+# branch identity.
+STRICT_CPU_META_FIELDS = ("strict_cpu_rng_seed", "cpu_rng_sha256_after_init")
+
 
 def validate_status(status):
     """Guard terminology: only coupling verdicts are legal statuses."""
@@ -179,6 +195,17 @@ def check_manifest(m):
         int(m["fork_chunk"])
     except Exception:
         return ["PAIR_MANIFEST_FORK_CHUNK: not an int"]
+    # Ledger-artifact hash bindings are MANDATORY for both roles so a pair can
+    # always be re-verified against its exact bytes (condition 3/D).
+    arts = m.get("artifacts")
+    if not isinstance(arts, dict) or \
+            any(k not in arts for k in ("factual_log", "counterfactual_log")):
+        return ["PAIR_MANIFEST_ARTIFACTS: need factual_log+counterfactual_log "
+                "artifact bindings"]
+    for rk in ("factual_log", "counterfactual_log"):
+        spec = arts[rk]
+        if not isinstance(spec, dict) or not spec.get("sha256"):
+            return ["PAIR_MANIFEST_ARTIFACT_SHA:%s missing sha256 binding" % rk]
     return []
 
 
@@ -188,6 +215,16 @@ def file_sha256(path):
         for chunk in iter(lambda: fh.read(65536), b""):
             hh.update(chunk)
     return hh.hexdigest()
+
+
+def _safe_int(v):
+    """int() that never raises: returns None for None/garbage (condition 2/C)."""
+    try:
+        if isinstance(v, bool):
+            return int(v)
+        return int(v)
+    except Exception:
+        return None
 
 
 def _artifact_sha(spec):
@@ -315,15 +352,21 @@ def validate_pair(factual_log, cf_log, pair_manifest,
                                % (meta_field, cv, mv))
         elif fv != cv:
             reasons.append("META_MISMATCH:%s across branches" % meta_field)
-    if int(fm.get("fork_chunk", -10 ** 9)) != fork_chunk or \
-       int(cm.get("fork_chunk", -10 ** 9)) != fork_chunk:
-        reasons.append("META_MISMATCH:fork_chunk factual=%r cf=%r manifest=%d"
-                       % (fm.get("fork_chunk"), cm.get("fork_chunk"), fork_chunk))
+    fc_f, fc_c = _safe_int(fm.get("fork_chunk")), _safe_int(cm.get("fork_chunk"))
+    if fc_f is None or fc_c is None or fc_f != fork_chunk or fc_c != fork_chunk:
+        reasons.append("META_MISMATCH:fork_chunk factual=%r cf=%r manifest=%r "
+                       "(malformed/missing numeric meta -> META_MISMATCH, "
+                       "never a crash)" %
+                       (fm.get("fork_chunk"), cm.get("fork_chunk"),
+                        m.get("fork_chunk")))
     for soft in ("torch", "diffusers"):
         fv, cv = fm.get(soft), cm.get(soft)
         if fv != cv:
-            if soft == "diffusers" and "UNDECLARED" in (fv, cv):
-                continue  # graceful when diffusers absent locally/emitter-side
+            if soft == "diffusers" and any(x in (fv, cv)
+                                           for x in IDENTITY_MARKERS):
+                continue  # graceful when diffusers absent locally/emitter-side;
+                          # launch-strict re-flags it below and the GPU
+                          # countersign helper refuses it unconditionally
             reasons.append("META_MISMATCH:%s across branches" % soft)
     fw, cw = fm.get("warp_seed") or {}, cm.get("warp_seed") or {}
     if fw != cw:
@@ -333,6 +376,35 @@ def validate_pair(factual_log, cf_log, pair_manifest,
     mw = m.get("warp_seed_sha256")
     if mw and fw.get("sha256") != mw:
         reasons.append("META_MISMATCH:warp_seed_sha vs manifest")
+
+    # -- strict CPU RNG evidence (condition B) --------------------------------
+    for sfield in STRICT_CPU_META_FIELDS:
+        sv, cv_ = fm.get(sfield), cm.get(sfield)
+        if sv is not None or cv_ is not None:
+            if sv != cv_:
+                reasons.append("META_MISMATCH:%s factual=%r cf=%r "
+                               "(derived seed is branch-independent)"
+                               % (sfield, sv, cv_))
+
+    # -- launch-strict identity gate (condition 3/D) ---------------------------
+    launch_strict = bool(m.get("launch_strict")) or \
+        os.environ.get(ENV_LAUNCH_STRICT, "") == "1"
+    if launch_strict:
+        for role_key, meta_r in ((factual_role, fm), (cf_role, cm)):
+            for idf in IDENTITY_META_FIELDS:
+                iv = meta_r.get(idf)
+                if iv is None or iv in IDENTITY_MARKERS:
+                    reasons.append(
+                        "IDENTITY_UNDECLARED:%s:%s value=%r (literal UNDECLARED/"
+                        "TEST_MODE_ONLY identity is ILLEGAL in launch-strict mode)"
+                        % (idf, role_key, iv))
+
+    # -- lazy-meta rewrite failure marker (condition 4/E) ----------------------
+    for role_key, parsed in ((factual_role, F), (cf_role, C)):
+        if any(e.get("event") == META_PATCH_FAILURE for e in parsed["events"]):
+            reasons.append("META_CONTINUATION_UNVERIFIED:%s ledger carries a %s "
+                           "event; strict certification aborts"
+                           % (role_key, META_PATCH_FAILURE))
 
     # -- events at the fork boundary ------------------------------------------
     f_cap = [e for e in F["events"]
@@ -567,6 +639,47 @@ def _r7_cross_branch(fd, cd):
                 "note": "tolerated after explained divergence; index ignored",
             })
     return diags, bad
+
+
+def refuse_gpu_countersign(result_or_manifest):
+    """Return True when the result/manifest may NEVER be GPU-countersigned.
+
+    Hard-refuses whenever an identity field (patch/profile/config sha256,
+    diffusers string) carries the literal "UNDECLARED" or the explicit local-CPU
+    "TEST_MODE_ONLY" marker, or when a validation result already carries
+    IDENTITY_UNDECLARED reasons. Such ledgers prove only that a harness ran on a
+    box without the real dependency stack; they cannot anchor a GPU-01 run.
+    """
+    blockers = []
+
+    def scan(o, path):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                p = "%s.%s" % (path, k)
+                if isinstance(v, str) and v in IDENTITY_MARKERS and \
+                        any(t in str(k) for t in
+                            ("diffusers", "sha256", "config", "profile",
+                             "patch")):
+                    blockers.append("%s=%r" % (p, v))
+                else:
+                    scan(v, p)
+        elif isinstance(o, list):
+            for i, v in enumerate(o):
+                scan(v, "%s[%d]" % (path, i))
+        elif isinstance(o, tuple):
+            for i, v in enumerate(o):
+                scan(v, "%s(%d)" % (path, i))
+        elif isinstance(o, str):
+            if o == "TEST_MODE_ONLY":
+                blockers.append("%s=TEST_MODE_ONLY" % path)
+
+    scan(result_or_manifest, "$")
+    reasons_ = getattr(result_or_manifest, "get", lambda *_: None)("reasons") \
+        if isinstance(result_or_manifest, dict) else None
+    for r in reasons_ or []:
+        if isinstance(r, str) and r.startswith("IDENTITY_UNDECLARED"):
+            blockers.append("reason:" + r)
+    return bool(blockers)
 
 
 def compare_coupling_logs(factual_log, cf_log, pair_manifest=None,

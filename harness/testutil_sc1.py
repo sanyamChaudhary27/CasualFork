@@ -1,4 +1,4 @@
-"""Shared CPU fixtures for SC1 validator/emitter suites (v1-updated + v2).
+"""Shared CPU fixtures for SC1 validator/emitter suites (v1-updated + v2 + final CPU round).
 
 Builds validator-shaped branch logs whose per-chunk draw grammar follows the
 RE-AUDITED pin order (sc1_grammar.DERIVATION):
@@ -7,6 +7,11 @@ RE-AUDITED pin order (sc1_grammar.DERIVATION):
 
 Deterministic throughout; mutation hooks let each Stage-C case inject exactly
 one controlled defect. No GPU, no pip installs; torch only for digests.
+
+FINAL CPU ROUND additions:
+  * make_mock_root carries every CANONICAL FIELD_SPEC path (F01-F14 numbering);
+  * make_engine_like_fixture() returns an engine-shaped (geo_state, pipeline,
+    locals) triple so tests can drive the REAL emitter build_live_state_view.
 """
 from __future__ import annotations
 
@@ -184,9 +189,111 @@ def write_branch(dirpath, role, run_id, **kw):
 
 
 # ---------------------------------------------------------------- digests ---
+def load_pin_banks():
+    """Return (frame_bank_module, da3_cloud_module) from the READ-ONLY pin, or
+    (None, None) when unavailable on this box."""
+    try:
+        import sys as _sys
+        import tempfile as _tf
+        pin = os.environ.get(
+            "EVOKE_PIN",
+            r"C:\Users\HP\AppData\Local\Temp\opencode\evoke-pin")
+        if not os.path.isdir(pin):
+            return None, None
+        _sys.dont_write_bytecode = True
+        _sys.pycache_prefix = os.path.join(_tf.gettempdir(), "sc1-util-pyc")
+        if pin not in _sys.path:
+            _sys.path.insert(0, pin)
+        from evoke.modules.geometric_state import frame_bank as fbm
+        from evoke.modules.geometric_state import da3_cloud as d3m
+        return fbm, d3m
+    except Exception:
+        return None, None
+
+
+def make_engine_like_fixture(seed=1000):
+    """Engine-shaped boundary state for driving the REAL emitter adapter.
+
+    Returns (geo_state, pipeline_stub, locals_view) where geo_state mirrors the
+    audited keys of pipeline_evoke.py _geo_init_state/_geo_da3_setup, the
+    pipeline stub mirrors the pipeline-persistent attributes referenced by the
+    adapter, and locals_view mirrors the __call__ function-locals passed at the
+    true chunk boundary (history latents/counter are post-prefix values).
+    REAL FrameBank / DA3FrameBank instances from the pin are attached when
+    importable; otherwise lightweight stand-ins are used (recorded honestly).
+    """
+    import types
+    import torch
+    g = torch.Generator().manual_seed(seed)
+
+    def t(*shape):
+        return torch.randn(*shape, generator=g)
+
+    fbm, d3m = load_pin_banks()
+    if fbm is not None:
+        fb = fbm.FrameBank(max_size=4)
+        for i in range(2):
+            fb.add(torch.full((3, 8, 8), float(i)), torch.eye(4),
+                   chunk_idx=i, pixel_idx=i * 10)
+        bank = d3m.DA3FrameBank(device="cpu")
+    else:
+        fb = {"entries": [{"frame": t(3, 8, 8), "c2w": torch.eye(4)}]}
+        bank = types.SimpleNamespace(
+            pts={}, c2ws={}, frames={}, _pt_mask={}, _probation={},
+            _carve_strike={}, _win_hist=[], _pinned_wins=[],
+            _ingest_calls=0, _sr_ingests=0, _sr_last=-10 ** 9, _ca_seen=0)
+    for gid in (1, 2):
+        bank.pts[gid] = (t(16, 3), t(16, 3))
+        bank.c2ws[gid] = torch.eye(4)
+        bank.frames[gid] = (t(8, 8), torch.eye(3), torch.eye(4), t(3, 8, 8))
+        bank._pt_mask[gid] = torch.ones(8, 8, dtype=torch.bool)
+        bank._probation[gid] = {"mask": torch.ones(8, 8, dtype=torch.bool)}
+        bank._carve_strike[gid] = torch.zeros(8, 8, dtype=torch.int16)
+    bank._ingest_calls = 42
+
+    class _Est:                                    # stream-state shape of ViGeo
+        process_res = 644
+        _scale_locked = None
+        _anchor_scales = []
+
+    geo_state = {
+        # audited live keys (pipeline_evoke.py :589-594/:632-633/:2231-2232/:2289)
+        "source_image_pixel": t(3, 33, 48),
+        "frame_bank": fb,
+        "prev_chunk_last_frame": t(1, 3, 33, 48),
+        "prev_chunk_last_decoded_latent": t(1, 16, 1, 6, 10),
+        "da3_est": _Est(),
+        "da3_bank": bank,
+        "da3_K_pix": t(3, 3),
+        "da3_pix_stride": 36,
+        "da3_lag": 1,
+        "da3_is_i2v": True,
+        "v2v_chunk0_anchor_pix_idx": None,
+    }
+    pipeline_stub = types.SimpleNamespace(
+        vae=types.SimpleNamespace(_conv_idx=[0]),
+        _geo_persist_feat_map=t(1, 8, 4, 6, 10),
+        _short_tier_print_count=0,
+        _decode_dump_idx=0,
+    )
+    locals_view = {
+        "history_latents": t(1, 16, 10, 6, 10),   # post-prefix rolling buffer
+        "total_generated_latent_frames": 10,       # total_generated_latent_frames
+        "event_set_size": 0,
+        "forced_off_flags": {
+            "use_kv_cache": False, "use_cfg_zero_star": False, "use_dmd": False,
+            "use_adaptive_anti_drifting": False, "use_interpolate_prompt": False,
+            "geo_disable_prev_short": False, "is_keep_x0": True,
+            "short_tier_noise_enabled": False,
+        },
+    }
+    return geo_state, pipeline_stub, locals_view
+
+
 def make_mock_root(seed=1234, real_banks=True):
-    """Mock pipeline root carrying every FIELD_SPEC attribute; attaches REAL
-    FrameBank / DA3FrameBank instances from the pinned clone when importable."""
+    """Mock state-view root carrying every CANONICAL FIELD_SPEC attribute;
+    attaches REAL FrameBank / DA3FrameBank instances from the pinned clone when
+    importable. Attribute names match the emitter LiveStateView exactly."""
     import torch
     g = torch.Generator().manual_seed(seed)
 
@@ -194,43 +301,46 @@ def make_mock_root(seed=1234, real_banks=True):
         return torch.randn(*shape, generator=g)
 
     root = {
+        # F01 history latents + counter (live locals at the boundary)
         "history_latents": t(1, 16, 9, 6, 10),
         "history_latent_counter": 3,
+        # F02 prev frame pix + latent (geo_state)
         "prev_frame_pix": t(1, 3, 33, 24, 40),
         "prev_frame_latent": t(1, 16, 1, 6, 10),
-        "counters_set": {"ingest_calls", "ca_seen"},
+        # F08 counters set (audited live counters, dict-valued)
+        "counters_set": {
+            "da3_bank__ingest_calls": 42, "da3_bank__sr_ingests": 0,
+            "da3_bank__sr_last": -10 ** 9, "da3_bank__ca_seen": 0,
+            "pipeline__short_tier_print_count": 0,
+            "pipeline__decode_dump_idx": 0,
+        },
+        # F07 persistent VAE feature cache + conv idx mirror
         "_geo_persist_feat_map": t(1, 8, 4, 6, 10),
-        "_geo_persist_feat_map_conv_idx": [0, 1, 2],
+        "_geo_persist_feat_map_conv_idx": [0],
+        # F11 config mirrors (geo_state da3_* values)
         "_geo_cfg_mirror_K_pix": t(3, 3),
         "_geo_cfg_mirror_stride": 36,
         "_geo_cfg_mirror_lag": 1,
+        # F09 estimator stream digest (ADVISORY)
         "estimator_stream_digest": sha("estimator-stream-%d" % seed),
+        # F13 config assertions
         "_geo_source_image_sha": sha("source-image"),
-        "_geo_anchor_c2w_assert": t(4, 4),
         "_geo_i2v_flag_assert": True,
+        "_geo_anchor_pix_idx_assert": None,
         "event_set_empty_assert": True,
+        # F14 forced-off flags assertion
         "_geo_forced_off_flags": {
-            "use_kv_cache": False, "restrict_self_attn": False,
-            "short_tier_noise_enabled": False, "invisible_history_noise": False,
-            "use_adaptive_anti_drifting": False, "use_dmd": False,
-            "geo_warp_patch_drop_ratio": 0.0, "geo_warp_vis_cap": 0.0,
+            "use_kv_cache": False, "use_cfg_zero_star": False, "use_dmd": False,
+            "use_adaptive_anti_drifting": False, "use_interpolate_prompt": False,
+            "geo_disable_prev_short": False, "is_keep_x0": True,
+            "short_tier_noise_enabled": False,
         },
     }
     fb = d3 = None
     if real_banks:
         try:
-            import sys as _sys
-            import tempfile as _tf
-            pin = os.environ.get(
-                "EVOKE_PIN",
-                r"C:\Users\HP\AppData\Local\Temp\opencode\evoke-pin")
-            if os.path.isdir(pin):
-                _sys.dont_write_bytecode = True
-                _sys.pycache_prefix = os.path.join(_tf.gettempdir(), "sc1-util-pyc")
-                if pin not in _sys.path:
-                    _sys.path.insert(0, pin)
-                from evoke.modules.geometric_state import frame_bank as fbm
-                from evoke.modules.geometric_state import da3_cloud as d3m
+            fbm, d3m = load_pin_banks()
+            if fbm is not None:
                 bank = fbm.FrameBank(max_size=4)
                 for i in range(2):
                     bank.add(torch.full((3, 8, 8), float(i)), torch.eye(4),
@@ -257,6 +367,7 @@ def make_mock_root(seed=1234, real_banks=True):
             "pts": {1: (t(16, 3), t(16, 3))}, "c2ws": {1: torch.eye(4)},
             "frames": {1: (t(8, 8),)}, "_pt_mask": {1: torch.ones(8, 8)},
             "_probation": {1: {}}, "_carve_strike": {1: torch.zeros(8, 8)},
+            "_win_hist": [], "_pinned_wins": [],
         }
     root["geo_frame_bank"] = fb
     root["geo_da3_bank"] = d3

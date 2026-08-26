@@ -53,7 +53,9 @@ STRICT_FORK_REL = os.path.join("evoke", "strict_fork.py")
 # --- edits: (file, label, anchor, replacement) ---------------------------------
 IMPORT_SF = (
     "from ..strict_fork import (\n"
+    "    build_live_state_view as _sf_build_live_state_view,\n"
     "    collect_generators as _sf_collect_generators,\n"
+    "    fork_mode_active as _sf_fork_active,\n"
     "    gen_state_of as _sf_gen_state,\n"
     "    log_draw as _sf_log_draw,\n"
     "    maybe_fork_boundary as _sf_maybe_fork_boundary,\n"
@@ -126,7 +128,7 @@ EDITS = [
      "        for i_s in range(stage2_num_stages):\n"
      "            _sf_set_stage(i_s)\n"),
 
-    (PIPELINE, "TRUE fork boundary at TOP of chunk loop (:2367); stage reset; replaces v1 mid-loop hook",
+    (PIPELINE, "TRUE fork boundary at TOP of chunk loop (:2367); stage reset; ephemeral live-state view; replaces v1 mid-loop hook",
      "        for k in _chunk_iter:\n",
      "        for k in _chunk_iter:\n"
      "            _sf_set_chunk(int(k))\n"
@@ -134,8 +136,29 @@ EDITS = [
      "            # [CausalFork SC1] TRUE fork boundary: TOP of the chunk loop - BEFORE prompt\n"
      "            # selection (:2413), warp render (:2617) / encode (:2628), prepare_latents (:2791):\n"
      "            # zero post-fork stochastic draws can precede capture/restore. No-op unless\n"
-     "            # EVOKE_STRICT_FORK_JSON is set.\n"
-     "            _sf_maybe_fork_boundary(int(k), _sf_collect_generators(generator, getattr(self, \"_geo_patchdrop_gen\", None)), self)\n"),
+     "            # EVOKE_STRICT_FORK_JSON is set. The EPHEMERAL NON-OWNING LiveStateView is\n"
+     "            # constructed FIRST (gated to StrictCoupling-active) from THIS iteration's\n"
+     "            # locals: history_latents / total_generated_latent_frames were last updated\n"
+     "            # by the PREVIOUS chunk iteration (:3019-3020), so the view reflects the\n"
+     "            # POST-PREFIX state at the true boundary; it is passed to the hook instead\n"
+     "            # of the raw pipeline. Observational-only: references live objects, never\n"
+     "            # clones, never mutates, no new persistent aliases on self.\n"
+     "            _sf_view = self\n"
+     "            if _sf_fork_active():\n"
+     "                _sf_view = _sf_build_live_state_view(\n"
+     "                    history_latents, total_generated_latent_frames, geo_state, self,\n"
+     "                    chunk_index=int(k), event_set_size=len(_event_set),\n"
+     "                    forced_off_flags={\n"
+     "                        \"use_kv_cache\": bool(use_kv_cache),\n"
+     "                        \"use_cfg_zero_star\": bool(use_cfg_zero_star),\n"
+     "                        \"use_dmd\": bool(use_dmd),\n"
+     "                        \"use_adaptive_anti_drifting\": bool(use_adaptive_anti_drifting),\n"
+     "                        \"use_interpolate_prompt\": bool(use_interpolate_prompt),\n"
+     "                        \"geo_disable_prev_short\": bool(geo_disable_prev_short),\n"
+     "                        \"is_keep_x0\": bool(is_keep_x0),\n"
+     "                        \"short_tier_noise_enabled\": bool((getattr(self, \"_short_tier_noise_cfg\", None) or {}).get(\"enabled\", False)),\n"
+     "                    })\n"
+     "            _sf_maybe_fork_boundary(int(k), _sf_collect_generators(generator, getattr(self, \"_geo_patchdrop_gen\", None)), _sf_view)\n"),
 
     (DA3CLOUD, "import strict_fork (da3_cloud)",
      "from .depth_backend import reset_stream as _reset_depth_stream\n",

@@ -335,14 +335,22 @@ def t_fork_capture_restore():
     old = {k: os.environ.get(k) for k in (sf.ENV_FORK, sf.ENV_RUN_ID)}
     try:
         with tempfile.TemporaryDirectory() as td:
-            root = tu.make_mock_root(seed=1000)
+            gsx, pipex, locx = tu.make_engine_like_fixture(seed=1000)
+
+            def _view(k):
+                return sf.build_live_state_view(
+                    locx["history_latents"],
+                    locx["total_generated_latent_frames"],
+                    gsx, pipex, chunk_index=k, event_set_size=0,
+                    forced_off_flags=locx["forced_off_flags"])
+
             gens = {"main": torch.Generator().manual_seed(9)}
             cap_cfg = {"fork_chunk": 2, "mode": "capture", "out_dir": td}
             os.environ[sf.ENV_FORK] = json.dumps(cap_cfg)
             torch.rand(3, generator=gens["main"])   # advance past prefix
-            sidecar = sf.maybe_fork_boundary(1, gens, pipeline=root)
+            sidecar = sf.maybe_fork_boundary(1, gens, pipeline=_view(1))
             assert sidecar is None                   # non-fork chunk: no-op
-            sidecar = sf.maybe_fork_boundary(2, gens, pipeline=root)
+            sidecar = sf.maybe_fork_boundary(2, gens, pipeline=_view(2))
             assert sidecar is not None and os.path.exists(sidecar)
             dg = os.path.join(td, "fork_state_digest_chunk2.json")
             assert os.path.exists(dg), os.listdir(td)
@@ -353,7 +361,7 @@ def t_fork_capture_restore():
             res_cfg = {"fork_chunk": 2, "mode": "restore", "sidecar": sidecar,
                        "parent_state_digest": dg}
             os.environ[sf.ENV_FORK] = json.dumps(res_cfg)
-            rec = sf.maybe_fork_boundary(2, gens, pipeline=root)
+            rec = sf.maybe_fork_boundary(2, gens, pipeline=_view(2))
             assert rec is not None
             assert sf.continuation_marker() == sc.GENERATOR_STATE_RESTORED
             x = torch.randn(11, generator=gens["main"])[0].item()
@@ -370,7 +378,7 @@ def t_fork_capture_restore():
             res_bad = dict(res_cfg, parent_state_digest=badp)
             os.environ[sf.ENV_FORK] = json.dumps(res_bad)
             try:
-                sf.maybe_fork_boundary(2, gens, pipeline=root)
+                sf.maybe_fork_boundary(2, gens, pipeline=_view(2))
                 raise AssertionError("corrupted parent digest must abort")
             except RuntimeError as exc:
                 assert "FORK_STATE_MISMATCH" in str(exc)
