@@ -43,10 +43,11 @@ EVOKE_STRICT_CONFIG_SHA256  launch-time identity declarations exported by the
                             launcher (see profiles/sc1_launcher_binding.md);
                             literal "UNDECLARED" is ILLEGAL in launch-strict
                             validation -> INVALID(IDENTITY_UNDECLARED).
-EVOKE_STRICT_CONFIG_SHA_ENGINE  optional engine-side RESOLVED-config sha (from
-                            preflight canonical_config over resolved argv),
-                            copied into meta.engine_resolved_config_sha256 when
-                            available; advisory identity evidence.
+EVOKE_GPU01_PRELAUNCH_ARTIFACT mandatory strict-launch archive written by the
+                             GPU-01 wrapper. The engine recomputes the canonical
+                             resolved config and rejects any mismatch before
+                             model construction; operator-provided config hashes
+                             are never an authority.
 EVOKE_STRICT_BASE_SEED      launcher-exported resolved --seed; input to the
                             strict CPU RNG derivation (condition B).
 EVOKE_TEST_MODE_ONLY        local-CPU-only marker: when diffusers is absent AND
@@ -102,6 +103,11 @@ import threading
 
 import torch
 
+try:  # Applied EVOKE tree; the fallback keeps source-level CPU tests standalone.
+    from . import gpu01_config_identity as _gpu01_identity
+except ImportError:  # pragma: no cover - exercised by harness source loader
+    import gpu01_config_identity as _gpu01_identity
+
 PATCH_TARGET_PIN = "74d268516d95c8fceadd2378f91a73f9f187042b"
 PATCH_ID = "evoke-74d26851-strict-coupling"
 
@@ -114,10 +120,11 @@ ENV_PAIR_ID = "EVOKE_STRICT_PAIR_ID"
 ENV_PATCH_SHA = "EVOKE_STRICT_PATCH_SHA256"
 ENV_PROFILE_SHA = "EVOKE_STRICT_PROFILE_SHA256"
 ENV_CONFIG_SHA = "EVOKE_STRICT_CONFIG_SHA256"
-ENV_CONFIG_SHA_ENGINE = "EVOKE_STRICT_CONFIG_SHA_ENGINE"
 ENV_BASE_SEED = "EVOKE_STRICT_BASE_SEED"
 ENV_TEST_MODE_ONLY = "EVOKE_TEST_MODE_ONLY"
 ENV_LAUNCH_STRICT = "EVOKE_STRICT_LAUNCH"
+ENV_PRELAUNCH_ARTIFACT = "EVOKE_GPU01_PRELAUNCH_ARTIFACT"
+ENV_PRELAUNCH_ARTIFACT_SHA = "EVOKE_GPU01_PRELAUNCH_ARTIFACT_SHA256"
 
 CONTINUATION_MARKER = "GENERATOR_STATE_RESTORED"
 META_PATCH_FAILURE_EVENT = "META_PATCH_FAILURE"
@@ -163,6 +170,7 @@ _RUN_CACHE = {}
 # condition B / condition E module state
 _STRICT_CPU_RNG = None            # evidence dict or None
 _META_CONTINUATION_VERIFIED = None   # None=never attempted, True/False
+_ENGINE_ATTESTATION = None
 
 
 def strict_launch_cudnn_settings():
@@ -180,6 +188,66 @@ def strict_launch_cudnn_settings():
 # This module is imported by the patched pipeline before its pipeline object is
 # constructed, so a strict launch resolves the process-local flags early.
 _STRICT_LAUNCH_CUDNN = strict_launch_cudnn_settings()
+
+
+def _file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def attest_engine_config(resolved_args, environ=None):
+    """Fail closed on strict launch before ``build_pipe`` can construct a model.
+
+    The only authority is the engine's own recomputation from parsed arguments
+    and actual environment, plus the wrapper-created archive it validates.
+    """
+    global _ENGINE_ATTESTATION
+    env = dict(os.environ if environ is None else environ)
+    if env.get(ENV_LAUNCH_STRICT) != "1":
+        return None
+    config = _gpu01_identity.canonical_gpu01_config(resolved_args, env)
+    actual = _gpu01_identity.gpu01_config_sha256(resolved_args, env)
+    if env.get(ENV_CONFIG_SHA) != actual:
+        raise RuntimeError("GPU01_ENGINE_CONFIG_MISMATCH")
+    path = env.get(ENV_PRELAUNCH_ARTIFACT)
+    if not path:
+        raise RuntimeError("GPU01_PRELAUNCH_EVIDENCE_MISSING")
+    try:
+        want_file_sha = env.get(ENV_PRELAUNCH_ARTIFACT_SHA)
+        got_file_sha = _file_sha256(path)
+        if want_file_sha != got_file_sha:
+            raise ValueError("artifact sha")
+        with open(path, "r", encoding="utf-8") as fh:
+            artifact = json.load(fh)
+        expected = {
+            "schema": "causalfork/gpu01-prelaunch@1",
+            "status": "GPU01_PRELAUNCH_PASS", "pin": PATCH_TARGET_PIN,
+            "pair_id": env.get(ENV_PAIR_ID), "run_id": env.get(ENV_RUN_ID),
+            "branch_id": env.get(ENV_BRANCH), "role": env.get(ENV_BRANCH),
+            "patch_sha256": env.get(ENV_PATCH_SHA),
+            "profile_sha256": env.get(ENV_PROFILE_SHA),
+            "common_config_sha256": actual,
+        }
+        if any(artifact.get(key) != value for key, value in expected.items()):
+            raise ValueError("artifact identity")
+        if artifact.get("canonical_config") != config or \
+                artifact.get("argv_sha256") != hashlib.sha256(json.dumps(
+                    artifact.get("argv"), sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=True).encode("utf-8")).hexdigest() or \
+                artifact.get("strict_env") != config.get("strict_env") or \
+                artifact.get("strict_env_sha256") != hashlib.sha256(json.dumps(
+                    config.get("strict_env"), sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=True).encode("utf-8")).hexdigest():
+            raise ValueError("artifact structural evidence")
+    except Exception as exc:
+        raise RuntimeError("GPU01_PRELAUNCH_EVIDENCE_MISSING:%s" %
+                           type(exc).__name__)
+    _ENGINE_ATTESTATION = {"config_sha256": actual,
+                           "prelaunch_artifact_sha256": got_file_sha}
+    return dict(_ENGINE_ATTESTATION)
 
 
 def get_branch_id():
@@ -472,7 +540,9 @@ def _ensure_meta_line():
         "profile_sha256": os.environ.get(ENV_PROFILE_SHA) or "UNDECLARED",
         "common_config_sha256": os.environ.get(ENV_CONFIG_SHA) or "UNDECLARED",
         "engine_resolved_config_sha256":
-            os.environ.get(ENV_CONFIG_SHA_ENGINE) or "UNDECLARED",
+            (_ENGINE_ATTESTATION or {}).get("config_sha256", "UNDECLARED"),
+        "prelaunch_artifact_sha256":
+            (_ENGINE_ATTESTATION or {}).get("prelaunch_artifact_sha256"),
         "fork_chunk": _safe_meta_int(cfg),
         "branch_id": get_branch_id(),
         "run_id": run_id(),
@@ -1298,7 +1368,8 @@ def _utcnow():
 def reset_for_tests():
     """Isolate module state between unit tests (not used on the engine path)."""
     global _FORK_CFG, _FORK_CFG_RAW, _LEDGER_FH, _META_WRITTEN, _RESTORED, \
-        _LEDGER_OPENED, _SEQ, _STRICT_CPU_RNG, _META_CONTINUATION_VERIFIED
+        _LEDGER_OPENED, _SEQ, _STRICT_CPU_RNG, _META_CONTINUATION_VERIFIED, \
+        _ENGINE_ATTESTATION
     with _LOCK:
         _ORDINALS.clear()
         _SEQ["n"] = 0
@@ -1319,3 +1390,4 @@ def reset_for_tests():
         _RUN_CACHE.clear()
         _STRICT_CPU_RNG = None
         _META_CONTINUATION_VERIFIED = None
+        _ENGINE_ATTESTATION = None

@@ -1,3 +1,80 @@
+diff --git a/evoke/gpu01_config_identity.py b/evoke/gpu01_config_identity.py
+new file mode 100644
+index 0000000..30ebc3f
+--- /dev/null
++++ b/evoke/gpu01_config_identity.py
+@@ -0,0 +1,71 @@
++"""Canonical GPU-01 resolved-config identity shared with the patched engine.
++
++Only an explicit branch/output classification may be omitted. Every other
++resolved infer_single option and audited strict environment input is retained.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++
++SCHEMA = "causalfork/gpu01-config-identity@1"
++
++# These are the only resolved argument names whose values may legitimately
++# differ across the prompt-only branch pair or name an output artifact.
++ALLOWED_BRANCH_DIVERGENCE = frozenset((
++    "prompt", "prompt_schedule", "chunk_prompts", "branch_id", "run_id",
++    "ledger_path", "output_folder", "output_path", "output_dir",
++))
++
++# Output-only options are a subset of the permitted branch divergence table.
++NONCAUSAL_OUTPUT_METADATA = frozenset((
++    "ledger_path", "output_folder", "output_path", "output_dir",
++    "save_chunk_segments", "dump_geo_intermediates", "bg_postprocess",
++    "ref_video_for_viz", "joystick_hud",
++))
++
++# Harness-only baseline annotations are not infer_single options and cannot be
++# launch inputs. They are retained solely for the preflight comparison API.
++IDENTITY_HARNESS_METADATA = frozenset(("expected_common_config_sha256",))
++
++# All resolved arguments not named above are common causal configuration. This
++# deliberately includes negative prompt, camera/pose, resolution, seeds,
++# steps/stages, GEO/depth backend, event_chunks, and strict-profile options.
++COMMON_CAUSAL_CONFIG = "all resolved args except ALLOWED_BRANCH_DIVERGENCE"
++
++# Audited environment inputs that can alter execution or strict control flow.
++STRICT_ENV_KEYS = (
++    "EVOKE_WARP_SEED", "EVOKE_STRICT_BASE_SEED", "EVOKE_STRICT_LAUNCH",
++    "EVOKE_STRICT_FORK_JSON", "EVOKE_CPU_THREADS", "EVOKE_INFER_DEBUG",
++    "EVOKE_INFER_PROGRESS", "GEO_HIST_MAX_FRAMES", "OMP_NUM_THREADS",
++    "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "CUDA_VISIBLE_DEVICES",
++    "CUBLAS_WORKSPACE_CONFIG", "PYTORCH_CUDA_ALLOC_CONF",
++)
++
++
++def _json(value):
++    return json.dumps(value, sort_keys=True, separators=(",", ":"),
++                      ensure_ascii=True)
++
++
++def canonical_gpu01_config(resolved_args, strict_env):
++    """Return the canonical, JSON-safe object used for GPU-01 identity."""
++    args = dict(resolved_args or {})
++    env = dict(strict_env or {})
++    common = {str(k): args[k] for k in sorted(args, key=str)
++              if k not in ALLOWED_BRANCH_DIVERGENCE and
++              k not in NONCAUSAL_OUTPUT_METADATA and
++              k not in IDENTITY_HARNESS_METADATA and
++              not str(k).startswith("_")}
++    audited_env = {key: env.get(key) for key in STRICT_ENV_KEYS
++                   if key in env or key in ("EVOKE_WARP_SEED",
++                                             "EVOKE_STRICT_BASE_SEED",
++                                             "EVOKE_STRICT_LAUNCH")}
++    return {"schema": SCHEMA, "resolved_args": common,
++            "strict_env": audited_env}
++
++
++def gpu01_config_sha256(resolved_args, strict_env):
++    """SHA-256 of :func:`canonical_gpu01_config`'s canonical JSON."""
++    return hashlib.sha256(_json(canonical_gpu01_config(
++        resolved_args, strict_env)).encode("utf-8")).hexdigest()
 diff --git a/evoke/modules/geometric_state/da3_cloud.py b/evoke/modules/geometric_state/da3_cloud.py
 index 4ebc620..33245ff 100644
 --- a/evoke/modules/geometric_state/da3_cloud.py
@@ -176,10 +253,10 @@ index 5d77a43..ddd9522 100644
              _t_diff_s = None
 diff --git a/evoke/strict_fork.py b/evoke/strict_fork.py
 new file mode 100644
-index 0000000..9d496ce
+index 0000000..c35e177
 --- /dev/null
 +++ b/evoke/strict_fork.py
-@@ -0,0 +1,1321 @@
+@@ -0,0 +1,1393 @@
 +"""CausalFork SC1 strict-coupling instrumentation V2 (+ FINAL CPU ROUND adapter).
 +
 +ADDED BY PATCH evoke-74d26851-strict-coupling (STAGE-B/C fix round + FINAL CPU
@@ -225,10 +302,11 @@ index 0000000..9d496ce
 +                            launcher (see profiles/sc1_launcher_binding.md);
 +                            literal "UNDECLARED" is ILLEGAL in launch-strict
 +                            validation -> INVALID(IDENTITY_UNDECLARED).
-+EVOKE_STRICT_CONFIG_SHA_ENGINE  optional engine-side RESOLVED-config sha (from
-+                            preflight canonical_config over resolved argv),
-+                            copied into meta.engine_resolved_config_sha256 when
-+                            available; advisory identity evidence.
++EVOKE_GPU01_PRELAUNCH_ARTIFACT mandatory strict-launch archive written by the
++                             GPU-01 wrapper. The engine recomputes the canonical
++                             resolved config and rejects any mismatch before
++                             model construction; operator-provided config hashes
++                             are never an authority.
 +EVOKE_STRICT_BASE_SEED      launcher-exported resolved --seed; input to the
 +                            strict CPU RNG derivation (condition B).
 +EVOKE_TEST_MODE_ONLY        local-CPU-only marker: when diffusers is absent AND
@@ -284,6 +362,11 @@ index 0000000..9d496ce
 +
 +import torch
 +
++try:  # Applied EVOKE tree; the fallback keeps source-level CPU tests standalone.
++    from . import gpu01_config_identity as _gpu01_identity
++except ImportError:  # pragma: no cover - exercised by harness source loader
++    import gpu01_config_identity as _gpu01_identity
++
 +PATCH_TARGET_PIN = "74d268516d95c8fceadd2378f91a73f9f187042b"
 +PATCH_ID = "evoke-74d26851-strict-coupling"
 +
@@ -296,10 +379,11 @@ index 0000000..9d496ce
 +ENV_PATCH_SHA = "EVOKE_STRICT_PATCH_SHA256"
 +ENV_PROFILE_SHA = "EVOKE_STRICT_PROFILE_SHA256"
 +ENV_CONFIG_SHA = "EVOKE_STRICT_CONFIG_SHA256"
-+ENV_CONFIG_SHA_ENGINE = "EVOKE_STRICT_CONFIG_SHA_ENGINE"
 +ENV_BASE_SEED = "EVOKE_STRICT_BASE_SEED"
 +ENV_TEST_MODE_ONLY = "EVOKE_TEST_MODE_ONLY"
 +ENV_LAUNCH_STRICT = "EVOKE_STRICT_LAUNCH"
++ENV_PRELAUNCH_ARTIFACT = "EVOKE_GPU01_PRELAUNCH_ARTIFACT"
++ENV_PRELAUNCH_ARTIFACT_SHA = "EVOKE_GPU01_PRELAUNCH_ARTIFACT_SHA256"
 +
 +CONTINUATION_MARKER = "GENERATOR_STATE_RESTORED"
 +META_PATCH_FAILURE_EVENT = "META_PATCH_FAILURE"
@@ -345,6 +429,7 @@ index 0000000..9d496ce
 +# condition B / condition E module state
 +_STRICT_CPU_RNG = None            # evidence dict or None
 +_META_CONTINUATION_VERIFIED = None   # None=never attempted, True/False
++_ENGINE_ATTESTATION = None
 +
 +
 +def strict_launch_cudnn_settings():
@@ -362,6 +447,66 @@ index 0000000..9d496ce
 +# This module is imported by the patched pipeline before its pipeline object is
 +# constructed, so a strict launch resolves the process-local flags early.
 +_STRICT_LAUNCH_CUDNN = strict_launch_cudnn_settings()
++
++
++def _file_sha256(path):
++    h = hashlib.sha256()
++    with open(path, "rb") as fh:
++        for chunk in iter(lambda: fh.read(65536), b""):
++            h.update(chunk)
++    return h.hexdigest()
++
++
++def attest_engine_config(resolved_args, environ=None):
++    """Fail closed on strict launch before ``build_pipe`` can construct a model.
++
++    The only authority is the engine's own recomputation from parsed arguments
++    and actual environment, plus the wrapper-created archive it validates.
++    """
++    global _ENGINE_ATTESTATION
++    env = dict(os.environ if environ is None else environ)
++    if env.get(ENV_LAUNCH_STRICT) != "1":
++        return None
++    config = _gpu01_identity.canonical_gpu01_config(resolved_args, env)
++    actual = _gpu01_identity.gpu01_config_sha256(resolved_args, env)
++    if env.get(ENV_CONFIG_SHA) != actual:
++        raise RuntimeError("GPU01_ENGINE_CONFIG_MISMATCH")
++    path = env.get(ENV_PRELAUNCH_ARTIFACT)
++    if not path:
++        raise RuntimeError("GPU01_PRELAUNCH_EVIDENCE_MISSING")
++    try:
++        want_file_sha = env.get(ENV_PRELAUNCH_ARTIFACT_SHA)
++        got_file_sha = _file_sha256(path)
++        if want_file_sha != got_file_sha:
++            raise ValueError("artifact sha")
++        with open(path, "r", encoding="utf-8") as fh:
++            artifact = json.load(fh)
++        expected = {
++            "schema": "causalfork/gpu01-prelaunch@1",
++            "status": "GPU01_PRELAUNCH_PASS", "pin": PATCH_TARGET_PIN,
++            "pair_id": env.get(ENV_PAIR_ID), "run_id": env.get(ENV_RUN_ID),
++            "branch_id": env.get(ENV_BRANCH), "role": env.get(ENV_BRANCH),
++            "patch_sha256": env.get(ENV_PATCH_SHA),
++            "profile_sha256": env.get(ENV_PROFILE_SHA),
++            "common_config_sha256": actual,
++        }
++        if any(artifact.get(key) != value for key, value in expected.items()):
++            raise ValueError("artifact identity")
++        if artifact.get("canonical_config") != config or \
++                artifact.get("argv_sha256") != hashlib.sha256(json.dumps(
++                    artifact.get("argv"), sort_keys=True, separators=(",", ":"),
++                    ensure_ascii=True).encode("utf-8")).hexdigest() or \
++                artifact.get("strict_env") != config.get("strict_env") or \
++                artifact.get("strict_env_sha256") != hashlib.sha256(json.dumps(
++                    config.get("strict_env"), sort_keys=True, separators=(",", ":"),
++                    ensure_ascii=True).encode("utf-8")).hexdigest():
++            raise ValueError("artifact structural evidence")
++    except Exception as exc:
++        raise RuntimeError("GPU01_PRELAUNCH_EVIDENCE_MISSING:%s" %
++                           type(exc).__name__)
++    _ENGINE_ATTESTATION = {"config_sha256": actual,
++                           "prelaunch_artifact_sha256": got_file_sha}
++    return dict(_ENGINE_ATTESTATION)
 +
 +
 +def get_branch_id():
@@ -654,7 +799,9 @@ index 0000000..9d496ce
 +        "profile_sha256": os.environ.get(ENV_PROFILE_SHA) or "UNDECLARED",
 +        "common_config_sha256": os.environ.get(ENV_CONFIG_SHA) or "UNDECLARED",
 +        "engine_resolved_config_sha256":
-+            os.environ.get(ENV_CONFIG_SHA_ENGINE) or "UNDECLARED",
++            (_ENGINE_ATTESTATION or {}).get("config_sha256", "UNDECLARED"),
++        "prelaunch_artifact_sha256":
++            (_ENGINE_ATTESTATION or {}).get("prelaunch_artifact_sha256"),
 +        "fork_chunk": _safe_meta_int(cfg),
 +        "branch_id": get_branch_id(),
 +        "run_id": run_id(),
@@ -1480,7 +1627,8 @@ index 0000000..9d496ce
 +def reset_for_tests():
 +    """Isolate module state between unit tests (not used on the engine path)."""
 +    global _FORK_CFG, _FORK_CFG_RAW, _LEDGER_FH, _META_WRITTEN, _RESTORED, \
-+        _LEDGER_OPENED, _SEQ, _STRICT_CPU_RNG, _META_CONTINUATION_VERIFIED
++        _LEDGER_OPENED, _SEQ, _STRICT_CPU_RNG, _META_CONTINUATION_VERIFIED, \
++        _ENGINE_ATTESTATION
 +    with _LOCK:
 +        _ORDINALS.clear()
 +        _SEQ["n"] = 0
@@ -1501,540 +1649,25 @@ index 0000000..9d496ce
 +        _RUN_CACHE.clear()
 +        _STRICT_CPU_RNG = None
 +        _META_CONTINUATION_VERIFIED = None
-
-[stderr]
-warning: in the working copy of 'sc1-p1/.gitignore', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/.gitignore', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/LICENSE', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/LICENSE', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/README.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/README.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/accelerate/zero2_1x8.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/accelerate/zero2_1x8.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/accelerate/zero2_6x8.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/accelerate/zero2_6x8.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/data/sample.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/data/sample.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/data/sample_segprompts.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/data/sample_segprompts.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/deepspeed/zero2.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/deepspeed/zero2.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/deepspeed/zero2_dualteacher_critic_sp.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/deepspeed/zero2_dualteacher_critic_sp.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/deepspeed/zero2_dualteacher_gen_sp.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/deepspeed/zero2_dualteacher_gen_sp.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/deepspeed/zero3.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/deepspeed/zero3.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/scheduler/scheduler_config.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/scheduler/scheduler_config.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/training/stage1_camera_control.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/training/stage1_camera_control.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/training/stage2_few_step_training.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/training/stage2_few_step_training.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/training/stage3_long_distillation.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/training/stage3_long_distillation.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/configs/training/stage3_post_distillation.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/configs/training/stage3_post_distillation.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/dataset/cond_y_fastpath.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/dataset/cond_y_fastpath.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/dataset/dataloader_dmd.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/dataset/dataloader_dmd.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/dataset/dataloader_history_latents_dist.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/dataset/dataloader_history_latents_dist.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/dataset/dataloader_mp4_dist.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/dataset/dataloader_mp4_dist.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/dataset/dataloader_multi_dataset.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/dataset/dataloader_multi_dataset.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/dataset/evoke_data/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/dataset/evoke_data/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/dataset/evoke_data/caption_operator.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/dataset/evoke_data/caption_operator.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/dataset/evoke_data/data_config.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/dataset/evoke_data/data_config.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/dataset/evoke_data/operators.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/dataset/evoke_data/operators.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/dataset/evoke_data/unified_dataset.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/dataset/evoke_data/unified_dataset.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/dataset/online_materialize.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/dataset/online_materialize.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/diffusers_version/scheduling_evoke_diffusers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/diffusers_version/scheduling_evoke_diffusers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/diffusers_version/transformer_evoke_diffusers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/diffusers_version/transformer_evoke_diffusers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/camera_control.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/camera_control.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_kernels/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_kernels/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_kernels/attention_dispatch.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_kernels/attention_dispatch.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_kernels/fp32_rmsnorm.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_kernels/fp32_rmsnorm.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_kernels/tiled_linear.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_kernels/tiled_linear.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_kernels/triton_norm.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_kernels/triton_norm.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_kernels/triton_rope.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_kernels/triton_rope.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_kernels/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_kernels/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_teacher/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_teacher/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_teacher/dit_sparse_14b.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_teacher/dit_sparse_14b.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_teacher/dit_sparse_cam_14b.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_teacher/dit_sparse_cam_14b.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_teacher/loader.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_teacher/loader.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_teacher/select_gate.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_teacher/select_gate.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_teacher/shared_host_base.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_teacher/shared_host_base.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_teacher/sp_runtime.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_teacher/sp_runtime.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_teacher/sp_zero3.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_teacher/sp_zero3.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/evoke_teacher/wrapper.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/evoke_teacher/wrapper.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/geometric_state/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/geometric_state/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/geometric_state/camera_warp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/geometric_state/camera_warp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/geometric_state/da3_cloud.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/geometric_state/da3_cloud.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/geometric_state/defaults.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/geometric_state/defaults.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/geometric_state/depth_backend.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/geometric_state/depth_backend.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/geometric_state/frame_bank.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/geometric_state/frame_bank.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/geometric_state/vigeo_cloud.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/geometric_state/vigeo_cloud.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/student_sp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/student_sp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/modules/transformer_evoke.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/modules/transformer_evoke.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/pipelines/pipeline_evoke.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/pipelines/pipeline_evoke.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/pipelines/pipeline_evoke_ode.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/pipelines/pipeline_evoke_ode.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/pipelines/pipeline_output.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/pipelines/pipeline_output.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/scheduler/scheduling_evoke.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/scheduler/scheduling_evoke.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/LICENSE', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/LICENSE', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/PROVENANCE.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/PROVENANCE.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/api.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/api.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/app/css_and_html.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/app/css_and_html.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/app/gradio_app.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/app/gradio_app.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/app/modules/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/app/modules/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/app/modules/event_handlers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/app/modules/event_handlers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/app/modules/file_handlers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/app/modules/file_handlers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/app/modules/model_inference.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/app/modules/model_inference.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/app/modules/ui_components.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/app/modules/ui_components.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/app/modules/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/app/modules/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/app/modules/visualization.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/app/modules/visualization.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/configs/eval_bench.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/configs/eval_bench.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/dataset.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/dataset.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/datasets/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/datasets/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/datasets/dtu.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/datasets/dtu.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/datasets/dtu64.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/datasets/dtu64.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/datasets/eth3d.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/datasets/eth3d.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/datasets/hiroom.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/datasets/hiroom.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/datasets/scannetpp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/datasets/scannetpp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/datasets/sevenscenes.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/datasets/sevenscenes.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/evaluator.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/evaluator.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/print_metrics.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/print_metrics.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/registries.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/registries.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/bench/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/bench/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/cfg.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/cfg.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/cli.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/cli.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/configs/da3-base.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/configs/da3-base.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/configs/da3-giant.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/configs/da3-giant.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/configs/da3-large.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/configs/da3-large.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/configs/da3-small.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/configs/da3-small.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/configs/da3metric-large.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/configs/da3metric-large.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/configs/da3mono-large.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/configs/da3mono-large.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/configs/da3nested-giant-large.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/configs/da3nested-giant-large.yaml', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/cam_dec.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/cam_dec.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/cam_enc.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/cam_enc.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/da3.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/da3.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dinov2/dinov2.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dinov2/dinov2.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/attention.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/attention.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/block.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/block.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/drop_path.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/drop_path.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/layer_scale.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/layer_scale.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/mlp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/mlp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/patch_embed.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/patch_embed.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/rope.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/rope.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/swiglu_ffn.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dinov2/layers/swiglu_ffn.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dinov2/vision_transformer.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dinov2/vision_transformer.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/dualdpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/dualdpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/gs_adapter.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/gs_adapter.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/gsdpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/gsdpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/reference_view_selector.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/reference_view_selector.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/utils/attention.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/utils/attention.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/utils/block.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/utils/block.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/utils/gs_renderer.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/utils/gs_renderer.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/utils/head_utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/utils/head_utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/model/utils/transform.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/model/utils/transform.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/registry.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/registry.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/services/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/services/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/services/backend.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/services/backend.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/services/gallery.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/services/gallery.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/services/inference_service.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/services/inference_service.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/services/input_handlers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/services/input_handlers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/specs.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/specs.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/alignment.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/alignment.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/api_helpers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/api_helpers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/camera_trj_helpers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/camera_trj_helpers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/constants.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/constants.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/export/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/export/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/export/colmap.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/export/colmap.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/export/depth_vis.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/export/depth_vis.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/export/feat_vis.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/export/feat_vis.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/export/glb.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/export/glb.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/export/gs.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/export/gs.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/export/npz.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/export/npz.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/export/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/export/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/geometry.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/geometry.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/gsply_helpers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/gsply_helpers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/io/input_processor.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/io/input_processor.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/io/output_processor.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/io/output_processor.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/layout_helpers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/layout_helpers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/logger.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/logger.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/memory.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/memory.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/model_loading.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/model_loading.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/parallel_utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/parallel_utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/pca_utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/pca_utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/pose_align.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/pose_align.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/ray_utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/ray_utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/read_write_model.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/read_write_model.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/registry.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/registry.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/sh_helpers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/sh_helpers.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/da3/depth_anything_3/utils/visualize.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/da3/depth_anything_3/utils/visualize.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/LICENSE', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/LICENSE', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/PROVENANCE.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/PROVENANCE.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/hub/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/hub/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/hub/backbones.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/hub/backbones.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/hub/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/hub/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/layers/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/layers/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/layers/attention.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/layers/attention.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/layers/block.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/layers/block.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/layers/dino_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/layers/dino_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/layers/drop_path.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/layers/drop_path.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/layers/layer_scale.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/layers/layer_scale.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/layers/mlp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/layers/mlp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/layers/patch_embed.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/layers/patch_embed.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/layers/swiglu_ffn.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/layers/swiglu_ffn.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/models/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/models/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/models/vision_transformer.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/models/vision_transformer.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/utils/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/utils/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/utils/cluster.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/utils/cluster.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/utils/config.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/utils/config.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/utils/dtype.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/utils/dtype.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/utils/param_groups.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/utils/param_groups.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/dinov2/utils/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/dinov2/utils/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/layers/attention.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/layers/attention.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/layers/block.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/layers/block.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/layers/camera_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/layers/camera_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/layers/conv_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/layers/conv_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/layers/pos_embed.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/layers/pos_embed.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/layers/prope.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/layers/prope.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/layers/transformer_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/layers/transformer_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/pi3.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/pi3.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/models/pi3x.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/models/pi3x.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/pipe/pi3x_vo.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/pipe/pi3x_vo.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/utils/basic.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/utils/basic.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/utils/debug.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/utils/debug.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/pi3/utils/geometry.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/pi3/utils/geometry.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/videoalign/LICENSE', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/videoalign/LICENSE', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/videoalign/PROVENANCE.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/videoalign/PROVENANCE.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/videoalign/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/videoalign/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/videoalign/data.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/videoalign/data.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/videoalign/inference.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/videoalign/inference.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/videoalign/prompt_template.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/videoalign/prompt_template.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/videoalign/train_reward.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/videoalign/train_reward.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/videoalign/trainer.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/videoalign/trainer.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/videoalign/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/videoalign/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/videoalign/vision_process.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/videoalign/vision_process.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/LICENSE', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/LICENSE', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/PROVENANCE.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/PROVENANCE.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/camera_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/camera_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/conv_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/conv_head.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/__init__.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/attention.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/attention.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/block.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/block.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/dinov2.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/dinov2.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/drop_path.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/drop_path.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/layer_scale.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/layer_scale.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/mask_utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/mask_utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/mlp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/mlp.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/patch_embed.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/patch_embed.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/prior_dinov2.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/prior_dinov2.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/rope.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/rope.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/layers/swiglu_ffn.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/layers/swiglu_ffn.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/transformer_decoder.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/transformer_decoder.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/utils.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/third_party/vigeo/vigeo/vigeo.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/third_party/vigeo/vigeo/vigeo.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/create_ema_zero3.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/create_ema_zero3.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/create_ema_zero3_lora.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/create_ema_zero3_lora.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/critic_update_schedule.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/critic_update_schedule.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/ev_validation.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/ev_validation.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/sf_prep_profile.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/sf_prep_profile.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/sf_warp_rollout.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/sf_warp_rollout.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/train_config.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/train_config.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/trajectory_capping.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/trajectory_capping.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/utils_base.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/utils_base.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/utils_evoke_base.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/utils_evoke_base.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/utils_evoke_post.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/utils_evoke_post.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/utils_recycle_batch.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/utils_recycle_batch.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/utils_recycle_single.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/utils_recycle_single.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/evoke/utils/yaml_inherit.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/utils/yaml_inherit.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/data/cases.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/data/cases.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/data/walking_tour_60s.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/data/walking_tour_60s.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/i2v/cases.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/i2v/cases.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/i2v/prompt.txt', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/i2v/prompt.txt', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/segment_prompts/cases.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/segment_prompts/cases.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/segment_prompts/cases_aurora.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/segment_prompts/cases_aurora.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/segment_prompts/cases_crystalstorm.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/segment_prompts/cases_crystalstorm.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/segment_prompts/cases_gateway.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/segment_prompts/cases_gateway.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/segment_prompts/cases_meteor.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/segment_prompts/cases_meteor.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/segment_prompts/schedule_aurora.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/segment_prompts/schedule_aurora.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/segment_prompts/schedule_crystalstorm.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/segment_prompts/schedule_crystalstorm.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/segment_prompts/schedule_gateway.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/segment_prompts/schedule_gateway.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/segment_prompts/schedule_meteor.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/segment_prompts/schedule_meteor.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/t2v/cases.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/t2v/cases.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/v2v/caption.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/v2v/caption.json', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/examples/v2v/cases.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/examples/v2v/cases.jsonl', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/requirements.txt', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/requirements.txt', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/inference/README.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/inference/README.md', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/inference/infer_batch.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/inference/infer_batch.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/inference/infer_evoke_teacher.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/inference/infer_evoke_teacher.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/inference/infer_evoke_teacher.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/inference/infer_evoke_teacher.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/inference/infer_post_distill.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/inference/infer_post_distill.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/inference/infer_single.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/inference/infer_single.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/inference/infer_stage1.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/inference/infer_stage1.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/inference/postprocess_viz.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/inference/postprocess_viz.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/training/train_stage1_camera_control.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/training/train_stage1_camera_control.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/training/train_stage2_few_step_training.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/training/train_stage2_few_step_training.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/training/train_stage3_long_distillation.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/training/train_stage3_long_distillation.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/scripts/training/train_stage3_post_distillation.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/scripts/training/train_stage3_post_distillation.sh', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/tools/freeze_cross_attn_ckpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/tools/freeze_cross_attn_ckpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/tools/merge_geo_lora_ckpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/tools/merge_geo_lora_ckpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/tools/merge_lora_ckpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/tools/merge_lora_ckpt.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-p1/train_evoke.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/train_evoke.py', LF will be replaced by CRLF the next time Git touches it
-warning: in the working copy of 'sc1-wk/evoke/strict_fork.py', LF will be replaced by CRLF the next time Git touches it
++        _ENGINE_ATTESTATION = None
+diff --git a/scripts/inference/infer_single.py b/scripts/inference/infer_single.py
+index e5f4299..9316fff 100644
+--- a/scripts/inference/infer_single.py
++++ b/scripts/inference/infer_single.py
+@@ -24,6 +24,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]   # scripts/inference/<this> ->
+ if str(REPO_ROOT) not in sys.path:                # so `import evoke` works when run directly
+     sys.path.insert(0, str(REPO_ROOT))
+ 
++from evoke.strict_fork import attest_engine_config as _sf_attest_engine_config
++
+ # EVOKE_CPU_THREADS: set by infer_batch to core_count // n_shards. The OMP_* env vars it also sets are
+ #   read at library init, but torch and OpenCV size their own pools independently of them, so cap those
+ #   here too. Unset -> leave every default alone (single-run behaviour is unchanged).
+@@ -1100,6 +1102,7 @@ def build_pipe(args):
+ 
+ def main(argv=None):
+     args = parse_args(argv)
++    _sf_attest_engine_config(vars(args), os.environ)
+     _check_prereqs(args)
+ 
+     output_dir = Path(args.output_folder)

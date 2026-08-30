@@ -20,9 +20,10 @@ import hashlib
 import json
 import os
 
+from gpu01_config_identity import gpu01_config_sha256
+
 DEFAULT_PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                os.pardir, "profiles", "sc1_strict_profile.json")
-PROMPT_FIELDS = ("prompt", "prompt_schedule", "chunk_prompts")
 
 # (rule_id, arg_key, predicate(value)->True means FORBIDDEN, human reason)
 FORBIDDEN_RULES = (
@@ -57,12 +58,9 @@ def _sha_of_text(t):
     return hashlib.sha256(t.encode("utf-8")).hexdigest()
 
 
-def canonical_config(args):
-    """Config identity: canonical JSON minus prompt-only fields."""
-    slim = {k: v for k, v in args.items()
-            if k not in PROMPT_FIELDS
-            and k not in ("expected_common_config_sha256", "_baseline_args")}
-    return _sha_of_text(json.dumps(slim, sort_keys=True, separators=(",", ":")))
+def canonical_config(args, env=None):
+    """Compatibility entry point for the canonical GPU-01 identity."""
+    return gpu01_config_sha256(args, os.environ if env is None else env)
 
 
 def placeholder_sha(args, key):
@@ -137,7 +135,7 @@ def preflight(args, env=None, profile_path=None):
                              "detail": "flag absent from resolved args; assert at G1"})
 
     # ---- config-hash baseline (test E trap) ----------------------------------
-    cfg_sha = canonical_config(args)
+    cfg_sha = canonical_config(args, env)
     expected = args.get("expected_common_config_sha256")
     if expected is not None and expected != cfg_sha:
         rng_keys = ("seed", "EVOKE_WARP_SEED", "num_inference_steps",

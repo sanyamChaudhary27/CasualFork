@@ -71,8 +71,8 @@ R2_R3_DIAG_FIELDS = ("sha256_input_pixels", "sha256_mean", "sha256_std")
 
 # FINAL CPU ROUND additions ----------------------------------------------------
 # Identity fields whose literal "UNDECLARED"/"TEST_MODE_ONLY" values are illegal
-# once LAUNCH-STRICT mode is active (manifest flag launch_strict=true OR env
-# EVOKE_STRICT_LAUNCH=1). Such ledgers can never be GPU-countersigned either
+# once the archived manifest declares literal launch_strict=true. Such ledgers
+# can never be GPU-countersigned either
 # (see refuse_gpu_countersign).
 IDENTITY_META_FIELDS = ("patch_sha256", "profile_sha256",
                         "common_config_sha256", "diffusers")
@@ -223,6 +223,15 @@ def check_manifest(m):
         spec = arts[rk]
         if not isinstance(spec, dict) or not spec.get("sha256"):
             return ["PAIR_MANIFEST_ARTIFACT_SHA:%s missing sha256 binding" % rk]
+    # GPU evidence is opt-in only via a literal JSON true. Ordinary CPU fixtures
+    # remain valid without prelaunch archives; GPU archives must bind both bytes.
+    if m.get("launch_strict") is True:
+        for role in ("factual", "counterfactual"):
+            key = role + "_prelaunch"
+            spec = arts.get(key)
+            if not isinstance(spec, dict) or not spec.get("path") or \
+                    not _is_sha256(spec.get("sha256")):
+                return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s" % key]
     return []
 
 
@@ -255,6 +264,45 @@ def _artifact_sha(spec):
 def _is_sha256(value):
     return isinstance(value, str) and len(value) == 64 and \
         all(ch in "0123456789abcdefABCDEF" for ch in value)
+
+
+def _validate_prelaunch_artifact(spec, manifest, ledger_meta, role):
+    """Validate one immutable wrapper archive against its ledger and manifest."""
+    try:
+        path, want = _artifact_sha(spec)
+        if not path or not want or file_sha256(path) != want:
+            return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:artifact_hash" % role]
+        with open(path, "r", encoding="utf-8") as fh:
+            artifact = json.load(fh)
+        if not isinstance(artifact, dict) or \
+                artifact.get("schema") != "causalfork/gpu01-prelaunch@1" or \
+                artifact.get("status") != "GPU01_PRELAUNCH_PASS":
+            return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:status" % role]
+        expected = {
+            "pair_id": manifest.get("pair_id"), "run_id": manifest["run_ids"].get(role),
+            "branch_id": role, "role": role, "pin": ledger_meta.get("pin"),
+            "patch_sha256": manifest.get("patch_sha256"),
+            "profile_sha256": manifest.get("profile_sha256"),
+            "common_config_sha256": manifest.get("common_config_sha256"),
+        }
+        if any(artifact.get(k) != v for k, v in expected.items()):
+            return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:identity" % role]
+        config = artifact.get("canonical_config")
+        argv = artifact.get("argv")
+        canonical_argv = json.dumps(argv, sort_keys=True, separators=(",", ":"),
+                                   ensure_ascii=True).encode("utf-8")
+        if not isinstance(config, dict) or not isinstance(argv, list) or \
+                artifact.get("argv_sha256") != hashlib.sha256(canonical_argv).hexdigest():
+            return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:structural" % role]
+        common = artifact.get("common_config_sha256")
+        if common != ledger_meta.get("engine_resolved_config_sha256") or \
+                common != ledger_meta.get("common_config_sha256"):
+            return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:config_binding" % role]
+        if ledger_meta.get("prelaunch_artifact_sha256") != want:
+            return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:ledger_archive_sha" % role]
+    except Exception:
+        return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:load" % role]
+    return []
 
 
 def validate_loaded_boundary_digest(manifest, ledger_meta, role):
@@ -472,8 +520,7 @@ def validate_pair(factual_log, cf_log, pair_manifest,
                            % (sfield, sv, cv_))
 
     # -- launch-strict identity gate (condition 3/D) ---------------------------
-    launch_strict = m.get("launch_strict") is True or \
-        os.environ.get(ENV_LAUNCH_STRICT, "") == "1"
+    launch_strict = m.get("launch_strict") is True
     if launch_strict:
         for role_key, meta_r in ((factual_role, fm), (cf_role, cm)):
             for idf in IDENTITY_META_FIELDS:
@@ -482,7 +529,10 @@ def validate_pair(factual_log, cf_log, pair_manifest,
                     reasons.append(
                         "IDENTITY_UNDECLARED:%s:%s value=%r (literal UNDECLARED/"
                         "TEST_MODE_ONLY identity is ILLEGAL in launch-strict mode)"
-                        % (idf, role_key, iv))
+                         % (idf, role_key, iv))
+        for role_key, meta_r in ((factual_role, fm), (cf_role, cm)):
+            spec = (m.get("artifacts") or {}).get(role_key + "_prelaunch")
+            reasons.extend(_validate_prelaunch_artifact(spec, m, meta_r, role_key))
 
     # -- lazy-meta rewrite failure marker (condition 4/E) ----------------------
     for role_key, parsed in ((factual_role, F), (cf_role, C)):

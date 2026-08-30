@@ -43,12 +43,14 @@ FRESH = os.path.join(BASE, "sc1-fresh")
 HERE = os.path.dirname(os.path.abspath(__file__))
 PATCH_OUT = os.path.join(HERE, "evoke-74d26851-strict-coupling.patch")
 SF_SRC = os.path.join(HERE, "evoke_strict_fork.py.txt")
+CONFIG_ID_SRC = os.path.join(HERE, os.pardir, "harness", "gpu01_config_identity.py")
 
 PIN = "74d268516d95c8fceadd2378f91a73f9f187042b"
 
 PIPELINE = os.path.join("evoke", "pipelines", "pipeline_evoke.py")
 DA3CLOUD = os.path.join("evoke", "modules", "geometric_state", "da3_cloud.py")
 STRICT_FORK_REL = os.path.join("evoke", "strict_fork.py")
+CONFIG_ID_REL = os.path.join("evoke", "gpu01_config_identity.py")
 
 # --- edits: (file, label, anchor, replacement) ---------------------------------
 IMPORT_SF = (
@@ -67,6 +69,15 @@ IMPORT_SF = (
 )
 
 EDITS = [
+    (os.path.join("scripts", "inference", "infer_single.py"),
+     "import strict engine attestation",
+     "# EVOKE_CPU_THREADS: set by infer_batch to core_count // n_shards. The OMP_* env vars it also sets are\n",
+     "from evoke.strict_fork import attest_engine_config as _sf_attest_engine_config\n\n"
+     "# EVOKE_CPU_THREADS: set by infer_batch to core_count // n_shards. The OMP_* env vars it also sets are\n"),
+    (os.path.join("scripts", "inference", "infer_single.py"),
+     "attest parsed strict launch before prereqs/model construction",
+     "    args = parse_args(argv)\n    _check_prereqs(args)\n",
+     "    args = parse_args(argv)\n    _sf_attest_engine_config(vars(args), os.environ)\n    _check_prereqs(args)\n"),
     (PIPELINE, "import strict_fork (pipeline)",
      "from diffusers.utils.torch_utils import randn_tensor\n",
      "from diffusers.utils.torch_utils import randn_tensor\n" + IMPORT_SF),
@@ -244,9 +255,20 @@ def apply_edits():
     with open(os.path.join(WK, STRICT_FORK_REL), "w", encoding="utf-8", newline="") as fh:
         fh.write(sf)
     print("[new ] %s (%d lines)" % (STRICT_FORK_REL, sf.count("\n")))
+    config_id = open(CONFIG_ID_SRC, "r", encoding="utf-8").read().replace("\r\n", "\n")
+    if not config_id.endswith("\n"):
+        config_id += "\n"
+    with open(os.path.join(WK, CONFIG_ID_REL), "w", encoding="utf-8", newline="") as fh:
+        fh.write(config_id)
+    if open(CONFIG_ID_SRC, "rb").read().replace(b"\r\n", b"\n") != \
+            open(os.path.join(WK, CONFIG_ID_REL), "rb").read():
+        raise SystemExit("canonical GPU-01 identity source was not copied byte-identically")
+    print("[new ] %s (%d lines; byte-identical canonical source)" %
+          (CONFIG_ID_REL, config_id.count("\n")))
     tmp = tempfile.mkdtemp(prefix="sc1-pyc-")
     try:
-        for i, rel in enumerate((PIPELINE, DA3CLOUD, STRICT_FORK_REL)):
+        for i, rel in enumerate((PIPELINE, DA3CLOUD, STRICT_FORK_REL, CONFIG_ID_REL,
+                                 os.path.join("scripts", "inference", "infer_single.py"))):
             py_compile.compile(os.path.join(WK, rel), cfile=os.path.join(tmp, "c%d.pyc" % i), doraise=True)
             print("[pyOK] %s" % rel)
     finally:
@@ -258,8 +280,20 @@ def apply_edits():
 
 
 def build_patch():
-    rc, stat = run(["git", "diff", "--no-index", "--stat", "--", "sc1-p1", "sc1-wk"], cwd=BASE, check=False)
-    rc, diff = run(["git", "diff", "--no-index", "--", "sc1-p1", "sc1-wk"], cwd=BASE, check=False)
+    # `diff` becomes the distributable patch bytes: capture stdout ONLY. Git on
+    # Windows may emit autocrlf warnings on stderr; appending those warnings made
+    # a technically applyable but contaminated patch artifact.
+    stat_p = subprocess.run(
+        ["git", "-c", "core.autocrlf=false", "diff", "--no-index", "--stat",
+         "--", "sc1-p1", "sc1-wk"], cwd=BASE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stat = stat_p.stdout.decode("utf-8", errors="replace")
+    diff_p = subprocess.run(
+        ["git", "-c", "core.autocrlf=false", "diff", "--no-index", "--",
+         "sc1-p1", "sc1-wk"], cwd=BASE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    rc = diff_p.returncode
+    diff = diff_p.stdout.decode("utf-8", errors="replace")
     if rc != 1:
         raise SystemExit("git diff --no-index returned %d (expected 1); output:\n%s" % (rc, diff))
 
@@ -283,6 +317,11 @@ def build_patch():
             files += 1
         elif line.startswith(("--- ", "+++ ")) and ("sc1-p1/" in line or "sc1-wk/" in line):
             line = fix_header(line)
+        # Upstream has a few blank lines containing one space. A changed hunk
+        # can render them as whitespace-only additions (`+ `); normalize those
+        # no-content lines so the distributable patch passes diff hygiene.
+        if line == "+ ":
+            line = "+"
         if line.startswith("+") and not line.startswith("+++"):
             added += 1
         elif line.startswith("-") and not line.startswith("---"):
@@ -314,12 +353,17 @@ def verify_patch():
     run(["git", "-c", "core.autocrlf=false", "apply", PATCH_OUT], cwd=FRESH)
     import filecmp
     bad = []
-    for rel in (PIPELINE, DA3CLOUD, STRICT_FORK_REL):
+    for rel in (PIPELINE, DA3CLOUD, STRICT_FORK_REL, CONFIG_ID_REL,
+                os.path.join("scripts", "inference", "infer_single.py")):
         if not filecmp.cmp(os.path.join(FRESH, rel), os.path.join(WK, rel), shallow=False):
             bad.append(rel)
     if bad:
         raise SystemExit("applied FRESH tree differs from WORK tree for %r" % bad)
-    print("[verify] applied FRESH == edited WORK byte-for-byte for all 3 files")
+    source = open(CONFIG_ID_SRC, "rb").read().replace(b"\r\n", b"\n")
+    copied = open(os.path.join(FRESH, CONFIG_ID_REL), "rb").read()
+    if source != copied:
+        raise SystemExit("applied canonical GPU-01 identity source differs from harness source")
+    print("[verify] applied FRESH == edited WORK byte-for-byte; canonical identity copy verified")
 
 
 def main():

@@ -9,6 +9,7 @@ import subprocess
 
 import env_fingerprint
 import flash_attn_preflight
+import gpu01_config_identity as config_identity
 
 GPU01_PRELAUNCH_PASS = "GPU01_PRELAUNCH_PASS"
 ENV_BRINGUP_FAILURE = "ENV_BRINGUP_FAILURE"
@@ -39,7 +40,7 @@ def _literal_true(manifest):
     return isinstance(manifest, dict) and manifest.get("launch_strict") is True
 
 
-def _identity_reasons(manifest, env, patch_path, profile_path):
+def _identity_reasons(manifest, env, patch_path, profile_path, config_sha=None):
     reasons = []
     supplied = (("patch_sha256", patch_path, "EVOKE_STRICT_PATCH_SHA256"),
                 ("profile_sha256", profile_path, "EVOKE_STRICT_PROFILE_SHA256"))
@@ -57,6 +58,10 @@ def _identity_reasons(manifest, env, patch_path, profile_path):
         value = manifest.get(field) if isinstance(manifest, dict) else None
         if value in IDENTITY_MARKERS or not is_sha256(value):
             reasons.append("IDENTITY_NOT_REAL:%s" % field)
+    if config_sha is not None and manifest.get("common_config_sha256") != config_sha:
+        reasons.append("IDENTITY_MANIFEST_HASH_MISMATCH:common_config_sha256")
+    if config_sha is not None and env.get("EVOKE_STRICT_CONFIG_SHA256") != config_sha:
+        reasons.append("IDENTITY_ENV_HASH_MISMATCH:common_config_sha256")
     return reasons
 
 
@@ -64,7 +69,7 @@ def validate_prelaunch(manifest, patch_path, profile_path, evoke_pin_path,
                        env=None, experiment_id=None, proposal_id=None,
                        pin_resolver=pin_revision, flash_probe=flash_attn_preflight.probe,
                        torch_module=None, fingerprint=env_fingerprint.fingerprint,
-                       run_id_is_fresh=None):
+                       run_id_is_fresh=None, config_sha=None):
     """Return one guard report; collaborators may inject every external probe."""
     env = dict(os.environ if env is None else env)
     reasons = []
@@ -79,7 +84,8 @@ def validate_prelaunch(manifest, patch_path, profile_path, evoke_pin_path,
         reasons.append("STRICT_LAUNCH_ENV_REQUIRED")
     if not _literal_true(manifest):
         reasons.append("LAUNCH_STRICT_LITERAL_TRUE_REQUIRED")
-    reasons.extend(_identity_reasons(manifest, env, patch_path, profile_path))
+    reasons.extend(_identity_reasons(manifest, env, patch_path, profile_path,
+                                     config_sha=config_sha))
     if not env.get("EVOKE_WARP_SEED"):
         reasons.append("WARP_SEED_REQUIRED")
     if not env.get("EVOKE_STRICT_BASE_SEED"):

@@ -13,8 +13,7 @@ The launcher exports, per run:
 |---|---|---|
 | `EVOKE_STRICT_PATCH_SHA256` | `patches/evoke-74d26851-strict-coupling.patch.sha256` sidecar (sha256 of the patch bytes) | emitter meta `patch_sha256` |
 | `EVOKE_STRICT_PROFILE_SHA256` | sha256 of `profiles/sc1_strict_profile.json` bytes | emitter meta `profile_sha256` |
-| `EVOKE_STRICT_CONFIG_SHA256` | **config identity** (formula below), computed by preflight over RESOLVED engine arguments + strict-relevant env | emitter meta `common_config_sha256` |
-| `EVOKE_STRICT_CONFIG_SHA_ENGINE` | optional: same config identity recomputed inside the engine process from resolved argv when available; copied to meta `engine_resolved_config_sha256` (advisory evidence that launcher and engine resolved the SAME arguments) | emitter meta |
+| `EVOKE_STRICT_CONFIG_SHA256` | **config identity** (formula below), computed by `harness/gpu01_launch.py` over RESOLVED engine arguments + strict-relevant env | engine attestation and emitter meta `common_config_sha256` |
 | `EVOKE_STRICT_BASE_SEED` | the resolved `--seed` integer passed to infer_single | strict CPU RNG derivation (condition B) |
 | `EVOKE_WARP_SEED` | PRECOND-1 fixed derived value | da3_cloud covis isolated generator |
 
@@ -28,14 +27,30 @@ common_config_sha256 = sha256( canonical_json({
     }) )
 ```
 
-implemented as `sc1_preflight.canonical_config(resolved_args)` (prompt-only
-fields excluded; negative prompt NOT excluded). Both branches MUST hash equal;
-the validator fails the pair otherwise (`META_MISMATCH:common_config_sha256`).
+implemented by the one canonical source `harness/gpu01_config_identity.py`,
+copied byte-identically into applied EVOKE as `evoke/gpu01_config_identity.py`.
+`sc1_preflight` and the patched engine use that same algorithm.
+`EVOKE_STRICT_CONFIG_SHA_ENGINE` is not read and has no authority.
+
+### Exact config-classification table
+
+| Table | Members / rule | Identity treatment |
+|---|---|---|
+| `COMMON_CAUSAL_CONFIG` | Every resolved `infer_single` argument not explicitly named in either exclusion table, plus audited strict environment. This includes negative prompt, camera/pose controls, resolution, seed, inference steps, stages, GEO/depth/backend choices, `event_chunks`, and all strict-profile options. | Included |
+| `ALLOWED_BRANCH_DIVERGENCE` | `prompt`, `prompt_schedule`, `chunk_prompts`, `branch_id`, `run_id`, `ledger_path`, `output_folder`, `output_path`, `output_dir` | Excluded |
+| `NONCAUSAL_OUTPUT_METADATA` | `ledger_path`, `output_folder`, `output_path`, `output_dir`, `save_chunk_segments`, `dump_geo_intermediates`, `bg_postprocess`, `ref_video_for_viz`, `joystick_hud` | Excluded |
+
+Audited environment keys are `EVOKE_WARP_SEED`, `EVOKE_STRICT_BASE_SEED`,
+`EVOKE_STRICT_LAUNCH`, `EVOKE_STRICT_FORK_JSON`, `EVOKE_CPU_THREADS`,
+`EVOKE_INFER_DEBUG`, `EVOKE_INFER_PROGRESS`, `GEO_HIST_MAX_FRAMES`,
+`OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+`CUDA_VISIBLE_DEVICES`, `CUBLAS_WORKSPACE_CONFIG`, and
+`PYTORCH_CUDA_ALLOC_CONF`. Both branches MUST hash equal; the validator fails
+the pair otherwise (`META_MISMATCH:common_config_sha256`).
 
 ## 2. Launch-strict mode
 
-Set `launch_strict: true` in the pair manifest OR export
-`EVOKE_STRICT_LAUNCH=1`. Archive GPU-01 pair manifests MUST record the literal
+Archive GPU-01 pair manifests MUST record the literal
 JSON boolean `"launch_strict": true`; missing, `false`, `null`, string
 `"true"`, and integer `1` are refused by `harness/gpu01_prelaunch.py` and
 `refuse_gpu_countersign()`. Routine local `TEST_MODE_ONLY` fixtures may omit it.
@@ -47,11 +62,28 @@ value counts as undeclared. Launch-strict mode additionally relies on the now-
 mandatory pair-manifest ledger-artifact bindings:
 `artifacts.factual_log.sha256` and `artifacts.counterfactual_log.sha256`
 (checked for EVERY pair since this round; see `PAIR_MANIFEST_ARTIFACT*`).
+For literal launch-strict manifests, the wrapper also archive-binds
+`artifacts.factual_prelaunch` and `artifacts.counterfactual_prelaunch` as
+`{path,sha256}`. The validator loads and hashes both, requires PASS and matching
+pair/run/role/pin/patch/profile/config identities, and requires
+`prelaunch.common_config_sha256 == ledger.engine_resolved_config_sha256 ==
+ledger.common_config_sha256 == manifest.common_config_sha256`.
 
 ## 3. GPU-01 prelaunch guard
 
-Run `python harness/gpu01_prelaunch.py` before importing EVOKE or constructing
-a model. It writes one JSON artifact whose status is exactly
+Run only the mandatory wrapper, with an exact argv list, before importing EVOKE
+or constructing a model:
+
+```text
+python harness/gpu01_launch.py --pair-manifest PAIR.json --patch PATCH --profile PROFILE \
+  --evoke-pin PIN --artifact PRELAUNCH.json -- python scripts/inference/infer_single.py ...
+```
+
+It resolves the current `infer_single` parser without calling `main`, computes
+the canonical hash, forces `EVOKE_STRICT_CONFIG_SHA256=<H>` and
+`EVOKE_STRICT_LAUNCH=1`, writes and binds the prelaunch artifact, and calls the
+exact list through `subprocess.run(..., shell=False)` only after PASS. It never
+uses an opaque shell command. Artifact status is exactly
 `GPU01_PRELAUNCH_PASS`, `ENV_BRINGUP_FAILURE`, or `GPU01_PRELAUNCH_REFUSED`.
 The guard requires experiment and proposal IDs `GPU-01`, the exact pinned
 EVOKE revision, literal archive strictness, hash equality between supplied
@@ -64,6 +96,14 @@ fingerprint before any hypothetical model load. These are deterministic-mode
 hints, not a claim of full CUDA bit determinism. The patched strict process
 reapplies and emits the same resolved `cudnn` evidence because launcher-process
 flags cannot persist across an external process boundary.
+The artifact records schema/status, experiment/proposal/pair/run/role IDs, pin,
+patch/profile/common-config SHA values, canonical config and SHA, argv and SHA,
+strict-env subset and SHA, fingerprint, flash result, cuDNN result, timestamp,
+and version. The patched strict process recomputes `H` after real argparse
+resolution and before `build_pipe`; it aborts `GPU01_ENGINE_CONFIG_MISMATCH` on
+mismatch. In strict mode it rejects a missing, mutated, or structurally
+inconsistent archive before ledger evidence can be emitted, and records its
+computed config and archive SHA in ledger meta.
 
 ## 4. TEST_MODE_ONLY and GPU countersigning
 

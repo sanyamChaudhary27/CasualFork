@@ -27,6 +27,8 @@ import sc1_preflight as pf            # noqa: E402
 import fork_state_digest as fsd       # noqa: E402
 import env_fingerprint as ef          # noqa: E402
 import gpu01_prelaunch as gp          # noqa: E402
+import gpu01_config_identity as gci   # noqa: E402
+import gpu01_launch as gl             # noqa: E402
 
 RESULTS = []
 
@@ -182,7 +184,8 @@ def t_e():
         "event_chunks": [],
         "prompt_schedule": [{"chunk": 1, "text": "baseline"}],
         "image_path": None, "lingbot_pose_path": None, "checkpoint_dir": None,
-        "expected_common_config_sha256": pf.canonical_config({"seed": 12345}),
+        "expected_common_config_sha256": pf.canonical_config({"seed": 12345},
+                                                              {"EVOKE_WARP_SEED": "777"}),
     }
     drifted = dict(base_args)
     drifted["_baseline_args"] = {k: v for k, v in base_args.items()
@@ -195,7 +198,8 @@ def t_e():
     hit = next(a for a in rep["aborts"] if a["code"] == "CONFIG_HASH_MISMATCH")
     assert hit["rng_relevant_change_detected"] is False   # prompt-only delta
     ok_args = dict(base_args,
-                   expected_common_config_sha256=pf.canonical_config(base_args))
+                   expected_common_config_sha256=pf.canonical_config(
+                       base_args, {"EVOKE_WARP_SEED": "777"}))
     rep_ok = pf.preflight(ok_args, env={"EVOKE_WARP_SEED": "777"})
     assert not any(a["code"] == "CONFIG_HASH_MISMATCH" for a in rep_ok["aborts"])
     return True
@@ -1191,6 +1195,33 @@ def t_mal():
     return True
 
 
+def _attach_strict_prelaunch(td, man, paths):
+    """Attach minimal valid archive bindings so a targeted strict test reaches its assertion."""
+    for role, path in paths:
+        archive = {
+            "schema": "causalfork/gpu01-prelaunch@1", "status": gp.GPU01_PRELAUNCH_PASS,
+            "pair_id": man["pair_id"], "run_id": man["run_ids"][role],
+            "branch_id": role, "role": role, "pin": tu.PIN,
+            "patch_sha256": man["patch_sha256"], "profile_sha256": man["profile_sha256"],
+            "common_config_sha256": man["common_config_sha256"],
+            "canonical_config": {"schema": gci.SCHEMA}, "argv": ["python", "infer_single.py"],
+        }
+        archive["argv_sha256"] = hashlib.sha256(json.dumps(
+            archive["argv"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        ap = os.path.join(td, role + ".ls.prelaunch.json")
+        with open(ap, "w", encoding="utf-8", newline="\n") as fh: fh.write(json.dumps(archive) + "\n")
+        ah = tu.file_art(ap)["sha256"]
+        objs = lines_of(path)
+        for obj in objs:
+            if obj.get("event") == "meta":
+                obj["engine_resolved_config_sha256"] = man["common_config_sha256"]
+                obj["prelaunch_artifact_sha256"] = ah
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n")
+        man["artifacts"][role + "_log"] = tu.file_art(path)
+        man["artifacts"][role + "_prelaunch"] = {"path": ap, "sha256": ah}
+
+
 def _ls_case(field, marker="UNDECLARED"):
     def fn():
         with tempfile.TemporaryDirectory() as td:
@@ -1205,8 +1236,9 @@ def _ls_case(field, marker="UNDECLARED"):
             man2 = tu.make_manifest((fp, cp2),
                                     (man["parent_state_digest"]["path"],
                                      man["child_state_digest"]["path"]),
-                                    ("run-F-fix", "run-C-fix"),
-                                    overrides={"launch_strict": True})
+                                     ("run-F-fix", "run-C-fix"),
+                                     overrides={"launch_strict": True})
+            _attach_strict_prelaunch(td, man2, (("factual", fp), ("counterfactual", cp2)))
             r = sc.validate_pair(fp, cp2, man2)
             assert not sc.is_pass(r), sc.format_result(r)
             hits = [x for x in r["reasons"]
@@ -1237,7 +1269,7 @@ t_ls_diffusers = case(
 )(_ls_case("diffusers"))
 
 
-@case("LS env flag EVOKE_STRICT_LAUNCH=1 activates the identity gate")
+@case("LS environment flag alone does not force ordinary fixture strictness")
 def t_ls_env():
     with tempfile.TemporaryDirectory() as td:
         fp, cp, man = tu.standard_pair(td)
@@ -1262,8 +1294,9 @@ def t_ls_env():
             else:
                 os.environ[sc.ENV_LAUNCH_STRICT] = old
         assert not sc.is_pass(r)
-        assert any(x.startswith("IDENTITY_UNDECLARED:patch_sha256")
-                   for x in r["reasons"]), r["reasons"][:8]
+        assert not any(x.startswith("IDENTITY_UNDECLARED:patch_sha256")
+                       for x in r["reasons"]), r["reasons"][:8]
+        assert any(x.startswith("META_MISMATCH:patch_sha256") for x in r["reasons"])
     return True
 
 
@@ -1324,6 +1357,30 @@ def t_ls_launch_strict_eligible():
         man2 = remanifest(man, fp2, cp2)
         man2.update(identities)
         man2["launch_strict"] = True
+        for role, path in (("factual", fp2), ("counterfactual", cp2)):
+            archive = {
+                "schema": "causalfork/gpu01-prelaunch@1",
+                "status": gp.GPU01_PRELAUNCH_PASS, "pair_id": man2["pair_id"],
+                "run_id": man2["run_ids"][role], "branch_id": role,
+                "role": role, "pin": tu.PIN, **identities,
+                "canonical_config": {"schema": gci.SCHEMA},
+                "argv": ["python", "infer_single.py"],
+            }
+            archive["argv_sha256"] = hashlib.sha256(json.dumps(
+                archive["argv"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            ap = os.path.join(td, role + ".prelaunch.json")
+            with open(ap, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(archive, sort_keys=True) + "\n")
+            ah = tu.file_art(ap)["sha256"]
+            man2["artifacts"][role + "_prelaunch"] = {"path": ap, "sha256": ah}
+            objs = lines_of(path)
+            for obj in objs:
+                if obj.get("event") == "meta":
+                    obj["engine_resolved_config_sha256"] = identities["common_config_sha256"]
+                    obj["prelaunch_artifact_sha256"] = ah
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n")
+            man2["artifacts"][role + "_log"] = tu.file_art(path)
         r = sc.validate_pair(fp2, cp2, man2)
         assert sc.is_pass(r), sc.format_result(r)
         assert sc.refuse_gpu_countersign(r) is False
@@ -1714,6 +1771,190 @@ def t_mpf():
         assert not sc.is_pass(r)
         assert any(x.startswith("META_CONTINUATION_UNVERIFIED:counterfactual")
                    for x in r["reasons"]), r["reasons"][-6:]
+    return True
+
+
+def _gpu01_archived_pair(td):
+    """A launch-strict pair with matching immutable wrapper archives."""
+    args = {"seed": 7, "height": 384, "width": 640,
+            "prompt": "ordinary scene", "event_chunks": []}
+    env = {"EVOKE_WARP_SEED": "77", "EVOKE_STRICT_BASE_SEED": "7",
+           "EVOKE_STRICT_LAUNCH": "1"}
+    identity = gci.gpu01_config_sha256(args, env)
+    fp, cp, man = tu.standard_pair(td)
+    man.update({"launch_strict": True, "patch_sha256": "a" * 64,
+                "profile_sha256": "b" * 64, "common_config_sha256": identity})
+    for role, path in (("factual", fp), ("counterfactual", cp)):
+        archive = {
+            "schema": "causalfork/gpu01-prelaunch@1", "status": gp.GPU01_PRELAUNCH_PASS,
+            "pair_id": man["pair_id"], "run_id": man["run_ids"][role],
+            "branch_id": role, "role": role, "pin": tu.PIN,
+            "patch_sha256": "a" * 64, "profile_sha256": "b" * 64,
+            "common_config_sha256": identity,
+            "canonical_config": gci.canonical_gpu01_config(args, env),
+            "argv": ["python", "scripts/inference/infer_single.py", "--seed", "7"],
+        }
+        archive["argv_sha256"] = hashlib.sha256(json.dumps(
+            archive["argv"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        ap = os.path.join(td, role + ".prelaunch.json")
+        with open(ap, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(archive, sort_keys=True) + "\n")
+        ah = tu.file_art(ap)["sha256"]
+        objs = lines_of(path)
+        for obj in objs:
+            if obj.get("event") == "meta":
+                obj.update(patch_sha256="a" * 64, profile_sha256="b" * 64,
+                           common_config_sha256=identity,
+                           engine_resolved_config_sha256=identity,
+                           prelaunch_artifact_sha256=ah)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n")
+        man["artifacts"][role + "_log"] = tu.file_art(path)
+        man["artifacts"][role + "_prelaunch"] = {"path": ap, "sha256": ah}
+    return fp, cp, man, args, env
+
+
+@case("L1 strict manifest bypass missing prelaunch -> INVALID")
+def t_l1():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man, _args, _env = _gpu01_archived_pair(td)
+        del man["artifacts"]["factual_prelaunch"]
+        r = sc.validate_pair(fp, cp, man)
+        assert not sc.is_pass(r) and any(x.startswith("GPU01_PRELAUNCH_EVIDENCE_MISSING") for x in r["reasons"])
+    return True
+
+
+@case("L2 fake A/B prelaunch archive -> INVALID")
+def t_l2():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man, _args, _env = _gpu01_archived_pair(td)
+        man["artifacts"]["counterfactual_prelaunch"] = dict(man["artifacts"]["factual_prelaunch"])
+        r = sc.validate_pair(fp, cp, man)
+        assert not sc.is_pass(r) and any("counterfactual:identity" in x for x in r["reasons"])
+    return True
+
+
+@case("L3 stale wrapper config versus parsed args -> GPU01_ENGINE_CONFIG_MISMATCH")
+def t_l3():
+    sf = _load_sf(); sf.reset_for_tests()
+    env = {"EVOKE_STRICT_LAUNCH": "1", "EVOKE_WARP_SEED": "1",
+           "EVOKE_STRICT_BASE_SEED": "1"}
+    env["EVOKE_STRICT_CONFIG_SHA256"] = gci.gpu01_config_sha256({"height": 1}, env)
+    try:
+        sf.attest_engine_config({"height": 2}, env)
+        raise AssertionError("stale config must abort")
+    except RuntimeError as exc:
+        assert "GPU01_ENGINE_CONFIG_MISMATCH" in str(exc)
+    return True
+
+
+@case("L4 stale manifest config binding -> INVALID")
+def t_l4():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man, _args, _env = _gpu01_archived_pair(td)
+        man["common_config_sha256"] = "d" * 64
+        assert not sc.is_pass(sc.validate_pair(fp, cp, man))
+    return True
+
+
+@case("L5 prompt-only branch configs have equal canonical hash")
+def t_l5():
+    env = {"EVOKE_WARP_SEED": "7", "EVOKE_STRICT_BASE_SEED": "4", "EVOKE_STRICT_LAUNCH": "1"}
+    a = {"prompt": "a red cube", "prompt_schedule": "[]", "height": 512, "seed": 4}
+    b = dict(a, prompt="a blue cube", prompt_schedule="[intervention]")
+    assert gci.gpu01_config_sha256(a, env) == gci.gpu01_config_sha256(b, env)
+    return True
+
+
+@case("L6 non-prompt config change differs and is invalid")
+def t_l6():
+    env = {"EVOKE_WARP_SEED": "7", "EVOKE_STRICT_BASE_SEED": "4", "EVOKE_STRICT_LAUNCH": "1"}
+    assert gci.gpu01_config_sha256({"height": 512}, env) != gci.gpu01_config_sha256({"height": 640}, env)
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man, _args, _env = _gpu01_archived_pair(td)
+        objs = lines_of(cp)
+        for obj in objs:
+            if obj.get("event") == "meta": obj["common_config_sha256"] = "e" * 64
+        with open(cp, "w", encoding="utf-8", newline="\n") as fh: fh.write("\n".join(json.dumps(o) for o in objs) + "\n")
+        man["artifacts"]["counterfactual_log"] = tu.file_art(cp)
+        assert not sc.is_pass(sc.validate_pair(fp, cp, man))
+    return True
+
+
+@case("L7 copied wrong-run prelaunch archive -> INVALID")
+def t_l7():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man, _args, _env = _gpu01_archived_pair(td)
+        ap = man["artifacts"]["counterfactual_prelaunch"]["path"]
+        archive = json.load(open(ap, encoding="utf-8")); archive["run_id"] = "wrong-run"
+        with open(ap, "w", encoding="utf-8", newline="\n") as fh: fh.write(json.dumps(archive) + "\n")
+        man["artifacts"]["counterfactual_prelaunch"] = tu.file_art(ap)
+        assert not sc.is_pass(sc.validate_pair(fp, cp, man))
+    return True
+
+
+@case("L8 mutated prelaunch bytes fail archive hash binding")
+def t_l8():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man, _args, _env = _gpu01_archived_pair(td)
+        with open(man["artifacts"]["factual_prelaunch"]["path"], "a", encoding="utf-8") as fh: fh.write(" ")
+        r = sc.validate_pair(fp, cp, man)
+        assert not sc.is_pass(r) and any("factual:artifact_hash" in x for x in r["reasons"])
+    return True
+
+
+@case("L9 direct strict engine path without archive -> abort")
+def t_l9():
+    sf = _load_sf(); sf.reset_for_tests()
+    env = {"EVOKE_STRICT_LAUNCH": "1", "EVOKE_WARP_SEED": "1", "EVOKE_STRICT_BASE_SEED": "1"}
+    env["EVOKE_STRICT_CONFIG_SHA256"] = gci.gpu01_config_sha256({"seed": 1}, env)
+    try:
+        sf.attest_engine_config({"seed": 1}, env)
+        raise AssertionError("raw strict path must require archive")
+    except RuntimeError as exc:
+        assert "GPU01_PRELAUNCH_EVIDENCE_MISSING" in str(exc)
+    return True
+
+
+@case("L10 wrapper refusal never invokes child runner")
+def t_l10():
+    with tempfile.TemporaryDirectory() as td:
+        mp = os.path.join(td, "manifest.json"); ap = os.path.join(td, "prelaunch.json")
+        with open(mp, "w", encoding="utf-8") as fh: json.dump({"pair_id": "p", "run_ids": {"factual": "f", "counterfactual": "c"}}, fh)
+        called = []
+        record = gl.launch(mp, "missing.patch", "missing.profile", td, ap,
+                           ["python", "infer_single.py"],
+                           env={"EVOKE_STRICT_PAIR_ID": "p", "EVOKE_STRICT_RUN_ID": "f", "EVOKE_STRICT_BRANCH_ID": "factual"},
+                           resolver=lambda *_: (_ for _ in ()).throw(ValueError("no parser")),
+                           runner=lambda *a, **k: called.append((a, k)))
+        assert record["status"] == gp.GPU01_PRELAUNCH_REFUSED and not called and os.path.exists(ap)
+    return True
+
+
+@case("L11 generated canonical identity source is byte-identical")
+def t_l11():
+    source = open(os.path.join(HERE, "gpu01_config_identity.py"), "rb").read().replace(b"\r\n", b"\n")
+    wk_copy = os.path.join(os.environ.get("TEMP", "/tmp"), "opencode", "sc1-wk", "evoke", "gpu01_config_identity.py")
+    if os.path.exists(wk_copy):
+        assert source == open(wk_copy, "rb").read()
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("patch_builder", os.path.join(HERE, os.pardir, "patches", "make_sc1_patch.py"))
+    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+    assert open(mod.CONFIG_ID_SRC, "rb").read().replace(b"\r\n", b"\n") == source
+    return True
+
+
+@case("L12 operator ENV_CONFIG_SHA_ENGINE cannot spoof engine attestation")
+def t_l12():
+    sf = _load_sf(); sf.reset_for_tests()
+    env = {"EVOKE_STRICT_LAUNCH": "1", "EVOKE_WARP_SEED": "1", "EVOKE_STRICT_BASE_SEED": "1",
+           "EVOKE_STRICT_CONFIG_SHA_ENGINE": "f" * 64}
+    env["EVOKE_STRICT_CONFIG_SHA256"] = gci.gpu01_config_sha256({"steps": 1}, env)
+    try:
+        sf.attest_engine_config({"steps": 2}, env)
+        raise AssertionError("operator advisory hash must not authorize launch")
+    except RuntimeError as exc:
+        assert "GPU01_ENGINE_CONFIG_MISMATCH" in str(exc)
     return True
 
 
