@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import gpu01_config_identity as config_identity
 import gpu01_fork_protocol as fork_protocol
 import gpu01_prelaunch as prelaunch
+import gpu01_completion as completion
 import sc1_preflight
 
 SCHEMA = "causalfork/gpu01-prelaunch@1"
@@ -176,6 +177,21 @@ def launch(pair_manifest_path, patch_path, profile_path, evoke_pin, artifact_pat
     })
     result = runner(list(child_argv), env=sealed_env, shell=False, check=False)
     record["child_returncode"] = getattr(result, "returncode", result)
+    record["prelaunch_artifact_path"] = os.path.abspath(artifact_path)
+    record["prelaunch_artifact_sha256"] = artifact_sha
+    completion_path = os.path.abspath(artifact_path + ".completion.json")
+    completion_record = completion.make(record, manifest, role)
+    completion.write(completion_path, completion_record)
+    record["completion_path"] = completion_path
+    record["completion_status"] = completion_record["status"]
+    if completion_record["status"] == completion.COMPLETE:
+        manifest = _load_manifest(pair_manifest_path)
+        artifacts = manifest.setdefault("artifacts", {})
+        artifacts[role + "_log"]["sha256"] = completion_record["ledger_sha256"]
+        artifacts[role + "_completion"] = {"path": completion_path,
+                                              "sha256": completion.sha256(completion_path),
+                                              "invocation_id": invocation_id}
+        _bind_artifact(pair_manifest_path, manifest, role, artifact_path, artifact_sha, invocation_id, protocol_sha)
     return record
 
 
@@ -194,7 +210,7 @@ def main(argv=None):
     record = launch(ns.pair_manifest, ns.patch, ns.profile, ns.evoke_pin,
                     ns.artifact, child)
     print(json.dumps(record, sort_keys=True, separators=(",", ":")))
-    return 0 if record["status"] == prelaunch.GPU01_PRELAUNCH_PASS else 1
+    return 0 if record.get("completion_status") == completion.COMPLETE else 1
 
 
 if __name__ == "__main__":
