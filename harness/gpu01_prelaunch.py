@@ -65,6 +65,66 @@ def _identity_reasons(manifest, env, patch_path, profile_path, config_sha=None):
     return reasons
 
 
+def validate_role_freshness(manifest, current_role):
+    """Validate the frozen factual -> counterfactual wrapper lifecycle."""
+    if current_role not in ("factual", "counterfactual"):
+        return ["CURRENT_ROLE_UNKNOWN:%s" % current_role]
+    sibling = "counterfactual" if current_role == "factual" else "factual"
+    artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else {}
+    artifacts = artifacts if isinstance(artifacts, dict) else {}
+    invocations = manifest.get("invocation_ids") if isinstance(manifest, dict) else {}
+    protocols = manifest.get("fork_protocol_sha256") if isinstance(manifest, dict) else {}
+    invocations = invocations if isinstance(invocations, dict) else {}
+    protocols = protocols if isinstance(protocols, dict) else {}
+
+    def log_spec(role):
+        spec = artifacts.get(role + "_log")
+        return spec if isinstance(spec, dict) else {}
+    def pre_spec(role):
+        spec = artifacts.get(role + "_prelaunch")
+        return spec if isinstance(spec, dict) else None
+
+    current_log = log_spec(current_role).get("path")
+    if not isinstance(current_log, str) or not current_log:
+        return ["CURRENT_ROLE_LEDGER_PATH_MISSING:%s" % current_role]
+    if os.path.exists(current_log):
+        return ["CURRENT_ROLE_LEDGER_EXISTS:%s" % current_role]
+    if pre_spec(current_role) is not None or invocations.get(current_role) or protocols.get(current_role):
+        return ["CURRENT_ROLE_ALREADY_BOUND:%s" % current_role]
+
+    sibling_log = log_spec(sibling).get("path")
+    if current_role == "factual":
+        if not isinstance(sibling_log, str) or not sibling_log:
+            return ["SIBLING_LEDGER_PATH_MISSING:%s" % sibling]
+        if os.path.exists(sibling_log) or pre_spec(sibling) is not None or \
+                invocations.get(sibling) or protocols.get(sibling):
+            return ["SIBLING_NOT_UNSTARTED:%s" % sibling]
+        return []
+
+    # Counterfactual requires an already completed factual sibling.
+    spec = pre_spec("factual")
+    if not isinstance(sibling_log, str) or not os.path.exists(sibling_log):
+        return ["SIBLING_FACTUAL_LEDGER_MISSING"]
+    if not spec or not spec.get("path") or not spec.get("sha256"):
+        return ["SIBLING_FACTUAL_PRELAUNCH_MISSING"]
+    try:
+        if file_sha256(spec["path"]) != spec["sha256"]:
+            return ["SIBLING_FACTUAL_PRELAUNCH_SHA_MISMATCH"]
+        with open(spec["path"], "r", encoding="utf-8") as fh:
+            archive = json.load(fh)
+    except Exception:
+        return ["SIBLING_FACTUAL_PRELAUNCH_UNREADABLE"]
+    run_ids = manifest.get("run_ids") or {}
+    if archive.get("status") != GPU01_PRELAUNCH_PASS or archive.get("pair_id") != manifest.get("pair_id") or \
+            archive.get("run_id") != run_ids.get("factual") or archive.get("role") != "factual" or \
+            archive.get("invocation_id") != invocations.get("factual"):
+        return ["SIBLING_FACTUAL_PRELAUNCH_IDENTITY_MISMATCH"]
+    declared_log_sha = log_spec("factual").get("sha256")
+    if declared_log_sha and file_sha256(sibling_log) != declared_log_sha:
+        return ["SIBLING_FACTUAL_LEDGER_SHA_MISMATCH"]
+    return []
+
+
 def validate_prelaunch(manifest, patch_path, profile_path, evoke_pin_path,
                        env=None, experiment_id=None, proposal_id=None,
                        pin_resolver=pin_revision, flash_probe=flash_attn_preflight.probe,
@@ -104,18 +164,8 @@ def validate_prelaunch(manifest, patch_path, profile_path, evoke_pin_path,
         elif factual == counterfactual:
             reasons.append("RUN_IDS_NOT_DISTINCT")
         else:
-            if run_id_is_fresh is None:
-                artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
-                paths = []
-                for role in ("factual", "counterfactual"):
-                    spec = artifacts.get(role + "_log") if isinstance(artifacts, dict) else None
-                    paths.append(spec.get("path") if isinstance(spec, dict) else None)
-                fresh = all(isinstance(path, str) and path and not os.path.exists(path)
-                            for path in paths)
-            else:
-                fresh = run_id_is_fresh(factual, counterfactual)
-            if not fresh:
-                reasons.append("RUN_IDS_NOT_FRESH")
+            role = env.get("EVOKE_STRICT_BRANCH_ID")
+            reasons.extend(validate_role_freshness(manifest, role))
     if reasons:
         return {"status": GPU01_PRELAUNCH_REFUSED, "reasons": reasons}
 

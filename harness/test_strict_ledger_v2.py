@@ -1572,11 +1572,14 @@ def t_gpu01_prelaunch():
                                            "sc1_strict_profile.json"))
     manifest = {"launch_strict": True, "pair_id": "pair-gpu01",
                 "run_ids": {"factual": "fresh-f", "counterfactual": "fresh-c"},
-                "patch_sha256": gp.file_sha256(patch),
-                "profile_sha256": gp.file_sha256(profile),
-                "common_config_sha256": "f" * 64}
+                 "patch_sha256": gp.file_sha256(patch),
+                 "profile_sha256": gp.file_sha256(profile),
+                 "common_config_sha256": "f" * 64,
+                 "artifacts": {"factual_log": {"path": os.path.join(tempfile.gettempdir(), "gpu01-preflight-fresh-f.jsonl")},
+                               "counterfactual_log": {"path": os.path.join(tempfile.gettempdir(), "gpu01-preflight-fresh-c.jsonl")}}}
     env = {"EVOKE_STRICT_LAUNCH": "1", "EVOKE_WARP_SEED": "1",
-           "EVOKE_STRICT_BASE_SEED": "2",
+            "EVOKE_STRICT_BASE_SEED": "2",
+            "EVOKE_STRICT_BRANCH_ID": "factual",
            "EVOKE_STRICT_PATCH_SHA256": manifest["patch_sha256"],
            "EVOKE_STRICT_PROFILE_SHA256": manifest["profile_sha256"]}
     common = dict(experiment_id="GPU-01", proposal_id="GPU-01",
@@ -1989,6 +1992,109 @@ def t_fork9():
         fp, cp, man, _a, _e = tu.make_gpu01_strict_pair(td)
         assert man["fork_protocol_sha256"]["factual"] != man["fork_protocol_sha256"]["counterfactual"]
         assert sc.is_pass(sc.validate_pair(fp, cp, man))
+    return True
+
+
+@case("GPU01-SEQUENTIAL-HAPPY-PATH factual then counterfactual wrapper lifecycle")
+def t_gpu01_sequential():
+    with tempfile.TemporaryDirectory() as td:
+        patch, profile = os.path.join(td, "p.patch"), os.path.join(td, "p.json")
+        open(patch, "w").write("patch\n"); open(profile, "w").write("{}\n")
+        args = {"seed": 7, "height": 384, "width": 640, "prompt": "x"}
+        base_env = {"EVOKE_WARP_SEED":"77", "EVOKE_STRICT_BASE_SEED":"7"}
+        common = gci.gpu01_config_sha256(args, dict(base_env, EVOKE_STRICT_LAUNCH="1"))
+        fl, cl = os.path.join(td, "f.jsonl"), os.path.join(td, "c.jsonl")
+        man = {"pair_id":"seq-pair", "run_ids":{"factual":"seq-f","counterfactual":"seq-c"},
+               "launch_strict":True, "patch_sha256":gp.file_sha256(patch), "profile_sha256":gp.file_sha256(profile),
+               "common_config_sha256":common, "fork_chunk":1,
+               "artifacts":{"factual_log":{"path":fl}, "counterfactual_log":{"path":cl}}}
+        mp = os.path.join(td, "manifest.json"); json.dump(man, open(mp,"w"))
+        old_pf = gl.sc1_preflight.preflight
+        gl.sc1_preflight.preflight = lambda *_a, **_k: {"status":"PASS", "aborts":[]}
+        def validator(manifest, patch_path, profile_path, pin, env, **_kw):
+            return gp.validate_prelaunch(manifest, patch_path, profile_path, pin, env=env,
+                experiment_id="GPU-01", proposal_id="GPU-01", config_sha=env["EVOKE_STRICT_CONFIG_SHA256"],
+                pin_resolver=lambda _p: gp.PIN, flash_probe=lambda:{"status":"PASS"},
+                fingerprint=lambda **_x:{})
+        calls=[]
+        def runner(argv, env, **_kw):
+            path = fl if env["EVOKE_STRICT_BRANCH_ID"] == "factual" else cl
+            open(path,"w").write("ledger\n"); calls.append(env); return 0
+        try:
+            fr = gl.launch(mp, patch, profile, td, os.path.join(td,"f.pre.json"), ["python","infer_single.py"],
+                env=dict(base_env, EVOKE_STRICT_PAIR_ID="seq-pair", EVOKE_STRICT_RUN_ID="seq-f", EVOKE_STRICT_BRANCH_ID="factual",
+                         EVOKE_STRICT_FORK_JSON=json.dumps({"fork_chunk":1,"mode":"capture","out_dir":td})),
+                resolver=lambda *_: args, validator=validator, runner=runner)
+            cr = gl.launch(mp, patch, profile, td, os.path.join(td,"c.pre.json"), ["python","infer_single.py"],
+                env=dict(base_env, EVOKE_STRICT_PAIR_ID="seq-pair", EVOKE_STRICT_RUN_ID="seq-c", EVOKE_STRICT_BRANCH_ID="counterfactual",
+                         EVOKE_STRICT_FORK_JSON=json.dumps({"fork_chunk":1,"mode":"restore","sidecar":"cap.json","parent_state_digest":"state.json"})),
+                resolver=lambda *_: args, validator=validator, runner=runner)
+        finally:
+            gl.sc1_preflight.preflight = old_pf
+        final = json.load(open(mp))
+        assert fr["status"] == gp.GPU01_PRELAUNCH_PASS and cr["status"] == gp.GPU01_PRELAUNCH_PASS
+        assert len(calls) == 2 and os.path.exists(fl) and os.path.exists(cl)
+        assert final["invocation_ids"]["factual"] != final["invocation_ids"]["counterfactual"]
+        assert "factual_prelaunch" in final["artifacts"] and "counterfactual_prelaunch" in final["artifacts"]
+    return True
+
+
+def _seq_manifest(td, completed=False):
+    fl, cl = os.path.join(td,"f.log"), os.path.join(td,"c.log")
+    m={"pair_id":"p","run_ids":{"factual":"f","counterfactual":"c"},"artifacts":{"factual_log":{"path":fl},"counterfactual_log":{"path":cl}}}
+    if completed:
+        open(fl,"w").write("factual\n")
+        a={"status":gp.GPU01_PRELAUNCH_PASS,"pair_id":"p","run_id":"f","role":"factual","invocation_id":"i-f"}
+        ap=os.path.join(td,"f.pre"); open(ap,"w").write(json.dumps(a))
+        m["artifacts"]["factual_prelaunch"]={"path":ap,"sha256":gp.file_sha256(ap)}
+        m["invocation_ids"]={"factual":"i-f"}; m["fork_protocol_sha256"]={"factual":"x"*64}
+    return m, fl, cl
+
+@case("SEQ1 fresh pair factual lifecycle passes")
+def t_seq1():
+    with tempfile.TemporaryDirectory() as td: assert not gp.validate_role_freshness(_seq_manifest(td)[0], "factual")
+    return True
+@case("SEQ2 completed factual permits counterfactual lifecycle")
+def t_seq2():
+    with tempfile.TemporaryDirectory() as td: assert not gp.validate_role_freshness(_seq_manifest(td, True)[0], "counterfactual")
+    return True
+@case("SEQ3 second factual launch is refused")
+def t_seq3():
+    with tempfile.TemporaryDirectory() as td: assert gp.validate_role_freshness(_seq_manifest(td, True)[0], "factual")
+    return True
+@case("SEQ4 existing counterfactual ledger is refused")
+def t_seq4():
+    with tempfile.TemporaryDirectory() as td:
+        m,_f,c=_seq_manifest(td,True); open(c,"w").write("old"); assert gp.validate_role_freshness(m,"counterfactual")
+    return True
+@case("SEQ5 counterfactual requires factual prelaunch")
+def t_seq5():
+    with tempfile.TemporaryDirectory() as td:
+        m,f,_c=_seq_manifest(td); open(f,"w").write("f"); assert gp.validate_role_freshness(m,"counterfactual") == ["SIBLING_FACTUAL_PRELAUNCH_MISSING"]
+    return True
+@case("SEQ6 foreign factual pair archive is refused")
+def t_seq6():
+    with tempfile.TemporaryDirectory() as td:
+        m,_f,_c=_seq_manifest(td,True); a=json.load(open(m["artifacts"]["factual_prelaunch"]["path"])); a["pair_id"]="other"; p=m["artifacts"]["factual_prelaunch"]["path"]; open(p,"w").write(json.dumps(a)); m["artifacts"]["factual_prelaunch"]["sha256"]=gp.file_sha256(p); assert gp.validate_role_freshness(m,"counterfactual")
+    return True
+@case("SEQ7 wrong factual run archive is refused")
+def t_seq7():
+    with tempfile.TemporaryDirectory() as td:
+        m,_f,_c=_seq_manifest(td,True); p=m["artifacts"]["factual_prelaunch"]["path"]; a=json.load(open(p)); a["run_id"]="wrong"; open(p,"w").write(json.dumps(a)); m["artifacts"]["factual_prelaunch"]["sha256"]=gp.file_sha256(p); assert gp.validate_role_freshness(m,"counterfactual")
+    return True
+@case("SEQ8 factual invocation mismatch is refused")
+def t_seq8():
+    with tempfile.TemporaryDirectory() as td:
+        m,_f,_c=_seq_manifest(td,True); m["invocation_ids"]["factual"]="wrong"; assert gp.validate_role_freshness(m,"counterfactual")
+    return True
+@case("SEQ9 factual refuses partially bound counterfactual")
+def t_seq9():
+    with tempfile.TemporaryDirectory() as td:
+        m,_f,_c=_seq_manifest(td); m["invocation_ids"]={"counterfactual":"partial"}; assert gp.validate_role_freshness(m,"factual")
+    return True
+@case("SEQ10 normal sequential path has no RUN_IDS_NOT_FRESH")
+def t_seq10():
+    with tempfile.TemporaryDirectory() as td: assert "RUN_IDS_NOT_FRESH" not in gp.validate_role_freshness(_seq_manifest(td,True)[0], "counterfactual")
     return True
 
 
