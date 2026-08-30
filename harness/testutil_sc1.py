@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 
 PIN = "74d268516d95c8fceadd2378f91a73f9f187042b"
 PATCH_ID = "evoke-74d26851-strict-coupling"
@@ -448,3 +449,60 @@ def standard_pair(tmpdir, chunks=3, fork_chunk=1, variant_f=None, variant_c=None
     man = make_manifest((fp, cp), (dp, dc), (run_f, run_c),
                         fork_chunk=fork_chunk)
     return fp, cp, man
+
+
+def make_gpu01_strict_pair(tmpdir, fork_chunk=1):
+    """Canonical fully admissible CPU launch-strict GPU-01 fixture.
+
+    All subsequent strict tests must mutate this evidence rather than recreate
+    partial historical archives.
+    """
+    import gpu01_config_identity as gci
+    import gpu01_fork_protocol as gfp
+    import gpu01_prelaunch as gp
+    args = {"seed": 7, "height": 384, "width": 640,
+            "prompt": "ordinary scene", "event_chunks": []}
+    env = {"EVOKE_WARP_SEED": "77", "EVOKE_STRICT_BASE_SEED": "7",
+           "EVOKE_STRICT_LAUNCH": "1"}
+    identity = gci.gpu01_config_sha256(args, env)
+    fp, cp, man = standard_pair(tmpdir, fork_chunk=fork_chunk)
+    man.update({"launch_strict": True, "patch_sha256": "a" * 64,
+                "profile_sha256": "b" * 64, "common_config_sha256": identity,
+                "invocation_ids": {}, "fork_protocol_sha256": {}})
+    configs = {
+        "factual": {"fork_chunk": fork_chunk, "mode": "capture", "out_dir": os.path.join(tmpdir, "capture")},
+        "counterfactual": {"fork_chunk": fork_chunk, "mode": "restore", "sidecar": os.path.join(tmpdir, "capture.json"),
+                             "parent_state_digest": man["parent_state_digest"]["path"]},
+    }
+    invocation_ids = {"factual": uuid.uuid4().hex, "counterfactual": uuid.uuid4().hex}
+    for role, path in (("factual", fp), ("counterfactual", cp)):
+        protocol = gfp.canonical_gpu01_fork_protocol(configs[role], role)
+        protocol_sha = gfp.gpu01_fork_protocol_sha256(configs[role], role)
+        archive = {"schema": "causalfork/gpu01-prelaunch@1", "status": gp.GPU01_PRELAUNCH_PASS,
+                   "pair_id": man["pair_id"], "run_id": man["run_ids"][role], "branch_id": role, "role": role,
+                   "pin": PIN, "patch_sha256": man["patch_sha256"], "profile_sha256": man["profile_sha256"],
+                   "common_config_sha256": identity, "invocation_id": invocation_ids[role],
+                   "fork_protocol_sha256": protocol_sha, "canonical_fork_protocol": protocol,
+                   "canonical_config": gci.canonical_gpu01_config(args, env),
+                   "argv": ["python", "scripts/inference/infer_single.py", "--seed", "7"]}
+        archive["argv_sha256"] = hashlib.sha256(json.dumps(archive["argv"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        ap = os.path.join(tmpdir, role + ".prelaunch.json")
+        with open(ap, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(archive, sort_keys=True) + "\n")
+        ah = file_art(ap)["sha256"]
+        objs = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+        for obj in objs:
+            if obj.get("event") == "meta":
+                obj.update(patch_sha256=man["patch_sha256"], profile_sha256=man["profile_sha256"],
+                           common_config_sha256=identity, engine_resolved_config_sha256=identity,
+                           engine_fork_protocol_sha256=protocol_sha, gpu01_invocation_id=invocation_ids[role],
+                           prelaunch_artifact_sha256=ah)
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(json.dumps(obj, sort_keys=True) for obj in objs) + "\n")
+        man["artifacts"][role + "_log"] = file_art(path)
+        man["artifacts"][role + "_prelaunch"] = {"path": ap, "sha256": ah,
+                                                     "invocation_id": invocation_ids[role],
+                                                     "fork_protocol_sha256": protocol_sha}
+        man["invocation_ids"][role] = invocation_ids[role]
+        man["fork_protocol_sha256"][role] = protocol_sha
+    return fp, cp, man, args, env

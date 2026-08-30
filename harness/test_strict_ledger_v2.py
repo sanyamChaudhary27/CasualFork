@@ -1225,7 +1225,7 @@ def _attach_strict_prelaunch(td, man, paths):
 def _ls_case(field, marker="UNDECLARED"):
     def fn():
         with tempfile.TemporaryDirectory() as td:
-            fp, cp, man = tu.standard_pair(td)
+            fp, cp, man, _args, _env = tu.make_gpu01_strict_pair(td)
 
             def poison(objs):
                 for o in objs:
@@ -1233,12 +1233,8 @@ def _ls_case(field, marker="UNDECLARED"):
                         o[field] = marker
                 return objs
             cp2 = rewrite(cp, poison, "ls.jsonl")
-            man2 = tu.make_manifest((fp, cp2),
-                                    (man["parent_state_digest"]["path"],
-                                     man["child_state_digest"]["path"]),
-                                     ("run-F-fix", "run-C-fix"),
-                                     overrides={"launch_strict": True})
-            _attach_strict_prelaunch(td, man2, (("factual", fp), ("counterfactual", cp2)))
+            man2 = copy.deepcopy(man)
+            man2["artifacts"]["counterfactual_log"] = tu.file_art(cp2)
             r = sc.validate_pair(fp, cp2, man2)
             assert not sc.is_pass(r), sc.format_result(r)
             hits = [x for x in r["reasons"]
@@ -1246,10 +1242,8 @@ def _ls_case(field, marker="UNDECLARED"):
             assert hits, r["reasons"][:10]
             # outside launch-strict the same ledger is only refused for
             # countersigning, not invalid outright
-            man3 = tu.make_manifest((fp, cp2),
-                                    (man["parent_state_digest"]["path"],
-                                     man["child_state_digest"]["path"]),
-                                    ("run-F-fix", "run-C-fix"))
+            man3 = copy.deepcopy(man2)
+            man3.pop("launch_strict", None)
             assert sc.refuse_gpu_countersign(r) is True, \
                 "IDENTITY_UNDECLARED result must be refused for GPU countersign"
             if field == "diffusers":
@@ -1340,47 +1334,7 @@ def t_ls_refuse_launch_strict():
 @case("LS GPU countersign permits launch_strict true with real identity IDs")
 def t_ls_launch_strict_eligible():
     with tempfile.TemporaryDirectory() as td:
-        fp, cp, man = tu.standard_pair(td)
-        identities = {
-            "patch_sha256": "a" * 64,
-            "profile_sha256": "b" * 64,
-            "common_config_sha256": "c" * 64,
-        }
-
-        def real_ids(objs):
-            for obj in objs:
-                if obj.get("event") == "meta":
-                    obj.update(identities)
-            return objs
-        fp2 = rewrite(fp, real_ids, "real-f.jsonl")
-        cp2 = rewrite(cp, real_ids, "real-c.jsonl")
-        man2 = remanifest(man, fp2, cp2)
-        man2.update(identities)
-        man2["launch_strict"] = True
-        for role, path in (("factual", fp2), ("counterfactual", cp2)):
-            archive = {
-                "schema": "causalfork/gpu01-prelaunch@1",
-                "status": gp.GPU01_PRELAUNCH_PASS, "pair_id": man2["pair_id"],
-                "run_id": man2["run_ids"][role], "branch_id": role,
-                "role": role, "pin": tu.PIN, **identities,
-                "canonical_config": {"schema": gci.SCHEMA},
-                "argv": ["python", "infer_single.py"],
-            }
-            archive["argv_sha256"] = hashlib.sha256(json.dumps(
-                archive["argv"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-            ap = os.path.join(td, role + ".prelaunch.json")
-            with open(ap, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(json.dumps(archive, sort_keys=True) + "\n")
-            ah = tu.file_art(ap)["sha256"]
-            man2["artifacts"][role + "_prelaunch"] = {"path": ap, "sha256": ah}
-            objs = lines_of(path)
-            for obj in objs:
-                if obj.get("event") == "meta":
-                    obj["engine_resolved_config_sha256"] = identities["common_config_sha256"]
-                    obj["prelaunch_artifact_sha256"] = ah
-            with open(path, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write("\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n")
-            man2["artifacts"][role + "_log"] = tu.file_art(path)
+        fp2, cp2, man2, _args, _env = tu.make_gpu01_strict_pair(td)
         r = sc.validate_pair(fp2, cp2, man2)
         assert sc.is_pass(r), sc.format_result(r)
         assert sc.refuse_gpu_countersign(r) is False
@@ -1775,43 +1729,7 @@ def t_mpf():
 
 
 def _gpu01_archived_pair(td):
-    """A launch-strict pair with matching immutable wrapper archives."""
-    args = {"seed": 7, "height": 384, "width": 640,
-            "prompt": "ordinary scene", "event_chunks": []}
-    env = {"EVOKE_WARP_SEED": "77", "EVOKE_STRICT_BASE_SEED": "7",
-           "EVOKE_STRICT_LAUNCH": "1"}
-    identity = gci.gpu01_config_sha256(args, env)
-    fp, cp, man = tu.standard_pair(td)
-    man.update({"launch_strict": True, "patch_sha256": "a" * 64,
-                "profile_sha256": "b" * 64, "common_config_sha256": identity})
-    for role, path in (("factual", fp), ("counterfactual", cp)):
-        archive = {
-            "schema": "causalfork/gpu01-prelaunch@1", "status": gp.GPU01_PRELAUNCH_PASS,
-            "pair_id": man["pair_id"], "run_id": man["run_ids"][role],
-            "branch_id": role, "role": role, "pin": tu.PIN,
-            "patch_sha256": "a" * 64, "profile_sha256": "b" * 64,
-            "common_config_sha256": identity,
-            "canonical_config": gci.canonical_gpu01_config(args, env),
-            "argv": ["python", "scripts/inference/infer_single.py", "--seed", "7"],
-        }
-        archive["argv_sha256"] = hashlib.sha256(json.dumps(
-            archive["argv"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        ap = os.path.join(td, role + ".prelaunch.json")
-        with open(ap, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps(archive, sort_keys=True) + "\n")
-        ah = tu.file_art(ap)["sha256"]
-        objs = lines_of(path)
-        for obj in objs:
-            if obj.get("event") == "meta":
-                obj.update(patch_sha256="a" * 64, profile_sha256="b" * 64,
-                           common_config_sha256=identity,
-                           engine_resolved_config_sha256=identity,
-                           prelaunch_artifact_sha256=ah)
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("\n".join(json.dumps(o, sort_keys=True) for o in objs) + "\n")
-        man["artifacts"][role + "_log"] = tu.file_art(path)
-        man["artifacts"][role + "_prelaunch"] = {"path": ap, "sha256": ah}
-    return fp, cp, man, args, env
+    return tu.make_gpu01_strict_pair(td)
 
 
 @case("L1 strict manifest bypass missing prelaunch -> INVALID")
@@ -1830,7 +1748,7 @@ def t_l2():
         fp, cp, man, _args, _env = _gpu01_archived_pair(td)
         man["artifacts"]["counterfactual_prelaunch"] = dict(man["artifacts"]["factual_prelaunch"])
         r = sc.validate_pair(fp, cp, man)
-        assert not sc.is_pass(r) and any("counterfactual:identity" in x for x in r["reasons"])
+        assert not sc.is_pass(r) and any("GPU01_PRELAUNCH_EVIDENCE_MISSING" in x for x in r["reasons"])
     return True
 
 
@@ -1955,6 +1873,122 @@ def t_l12():
         raise AssertionError("operator advisory hash must not authorize launch")
     except RuntimeError as exc:
         assert "GPU01_ENGINE_CONFIG_MISMATCH" in str(exc)
+    return True
+
+
+@case("GPU01-HAPPY-PATH canonical launch-strict fixture -> STRICT_NOISE_COUPLED")
+def t_gpu01_happy():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man, _args, _env = tu.make_gpu01_strict_pair(td)
+        r = sc.validate_pair(fp, cp, man)
+        assert sc.is_pass(r), sc.format_result(r)
+        assert sc.refuse_gpu_countersign(r) is False
+    return True
+
+
+@case("INV1 canonical strict fixture has fresh nonempty distinct invocation IDs")
+def t_inv1():
+    with tempfile.TemporaryDirectory() as td:
+        _fp, _cp, man, _a, _e = tu.make_gpu01_strict_pair(td)
+        ids = man["invocation_ids"]
+        assert ids["factual"] and ids["counterfactual"] and ids["factual"] != ids["counterfactual"]
+    return True
+
+
+@case("INV2 existing artifact path refuses and does not call child")
+def t_inv2():
+    with tempfile.TemporaryDirectory() as td:
+        ap = os.path.join(td, "exists.json"); open(ap, "w").write("old\n")
+        mp = os.path.join(td, "m.json"); json.dump({}, open(mp, "w"))
+        called = []
+        r = gl.launch(mp, "x", "y", td, ap, ["python", "infer_single.py"],
+                      resolver=lambda *_: {}, runner=lambda *a, **k: called.append(1))
+        assert r["status"] == gp.GPU01_PRELAUNCH_REFUSED and not called
+    return True
+
+
+def _invalidate_invocation(which):
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man, _a, _e = tu.make_gpu01_strict_pair(td)
+        if which == "ledger":
+            objs = lines_of(cp)
+            for o in objs:
+                if o.get("event") == "meta": o["gpu01_invocation_id"] = "old-invocation"
+            with open(cp, "w", encoding="utf-8") as fh: fh.write("\n".join(json.dumps(o) for o in objs) + "\n")
+            man["artifacts"]["counterfactual_log"] = tu.file_art(cp)
+        else:
+            man["invocation_ids"]["counterfactual"] = "old-invocation"
+        assert not sc.is_pass(sc.validate_pair(fp, cp, man))
+
+
+@case("INV3 old archive invocation cannot validate same pair/run")
+def t_inv3(): _invalidate_invocation("manifest"); return True
+@case("INV4 ledger invocation mismatch -> INVALID")
+def t_inv4(): _invalidate_invocation("ledger"); return True
+@case("INV5 updated artifact binding with stale invocation -> INVALID")
+def t_inv5(): _invalidate_invocation("manifest"); return True
+@case("INV6 independent strict fixtures have distinct invocation identities")
+def t_inv6():
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        ia = tu.make_gpu01_strict_pair(a)[2]["invocation_ids"]
+        ib = tu.make_gpu01_strict_pair(b)[2]["invocation_ids"]
+        assert ia != ib
+    return True
+
+
+@case("FORK1 capture/restore preserve common config identity")
+def t_fork1():
+    env = {"EVOKE_WARP_SEED":"7", "EVOKE_STRICT_BASE_SEED":"4", "EVOKE_STRICT_LAUNCH":"1", "EVOKE_STRICT_FORK_JSON":"different"}
+    assert gci.gpu01_config_sha256({"height":512,"prompt":"f"}, env) == gci.gpu01_config_sha256({"height":512,"prompt":"c"}, dict(env, EVOKE_STRICT_FORK_JSON="other"))
+    return True
+
+@case("FORK2 factual restore is refused")
+def t_fork2():
+    import gpu01_fork_protocol as f
+    try: f.canonical_gpu01_fork_protocol({"fork_chunk":1,"mode":"restore","sidecar":"x","parent_state_digest":"y"}, "factual")
+    except ValueError: return True
+    raise AssertionError("accepted factual restore")
+@case("FORK3 counterfactual capture is refused")
+def t_fork3():
+    import gpu01_fork_protocol as f
+    try: f.canonical_gpu01_fork_protocol({"fork_chunk":1,"mode":"capture","out_dir":"x"}, "counterfactual")
+    except ValueError: return True
+    raise AssertionError("accepted counterfactual capture")
+@case("FORK4 fork chunk mismatch invalidates strict pair")
+def t_fork4():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man, _a, _e = tu.make_gpu01_strict_pair(td); man["fork_chunk"] = 2
+        assert not sc.is_pass(sc.validate_pair(fp, cp, man))
+    return True
+@case("FORK5 restore missing sidecar is refused")
+def t_fork5():
+    import gpu01_fork_protocol as f
+    try: f.canonical_gpu01_fork_protocol({"fork_chunk":1,"mode":"restore","parent_state_digest":"x"}, "counterfactual")
+    except ValueError: return True
+    raise AssertionError("accepted missing sidecar")
+@case("FORK6 restore missing parent digest is refused")
+def t_fork6():
+    import gpu01_fork_protocol as f
+    try: f.canonical_gpu01_fork_protocol({"fork_chunk":1,"mode":"restore","sidecar":"x"}, "counterfactual")
+    except ValueError: return True
+    raise AssertionError("accepted missing digest")
+@case("FORK7 inline and file JSON share semantic protocol SHA")
+def t_fork7():
+    import gpu01_fork_protocol as f
+    with tempfile.TemporaryDirectory() as td:
+        cfg={"fork_chunk":1,"mode":"capture","out_dir":"x"}; p=os.path.join(td,"f.json"); json.dump(cfg,open(p,"w"))
+        assert f.gpu01_fork_protocol_sha256(json.dumps(cfg), "factual") == f.gpu01_fork_protocol_sha256(p, "factual")
+    return True
+@case("FORK8 common model drift changes config identity")
+def t_fork8():
+    assert gci.gpu01_config_sha256({"height":1}, {}) != gci.gpu01_config_sha256({"height":2}, {})
+    return True
+@case("FORK9 prompt plus capture/restore is structurally valid")
+def t_fork9():
+    with tempfile.TemporaryDirectory() as td:
+        fp, cp, man, _a, _e = tu.make_gpu01_strict_pair(td)
+        assert man["fork_protocol_sha256"]["factual"] != man["fork_protocol_sha256"]["counterfactual"]
+        assert sc.is_pass(sc.validate_pair(fp, cp, man))
     return True
 
 
