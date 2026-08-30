@@ -230,8 +230,12 @@ def check_manifest(m):
             key = role + "_prelaunch"
             spec = arts.get(key)
             if not isinstance(spec, dict) or not spec.get("path") or \
-                    not _is_sha256(spec.get("sha256")):
+                    not _is_sha256(spec.get("sha256")) or not spec.get("invocation_id") or \
+                    not _is_sha256(spec.get("fork_protocol_sha256")):
                 return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s" % key]
+            if (m.get("invocation_ids") or {}).get(role) != spec.get("invocation_id") or \
+                    (m.get("fork_protocol_sha256") or {}).get(role) != spec.get("fork_protocol_sha256"):
+                return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:manifest_binding" % key]
     return []
 
 
@@ -284,6 +288,8 @@ def _validate_prelaunch_artifact(spec, manifest, ledger_meta, role):
             "patch_sha256": manifest.get("patch_sha256"),
             "profile_sha256": manifest.get("profile_sha256"),
             "common_config_sha256": manifest.get("common_config_sha256"),
+            "invocation_id": (manifest.get("invocation_ids") or {}).get(role),
+            "fork_protocol_sha256": (manifest.get("fork_protocol_sha256") or {}).get(role),
         }
         if any(artifact.get(k) != v for k, v in expected.items()):
             return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:identity" % role]
@@ -298,6 +304,10 @@ def _validate_prelaunch_artifact(spec, manifest, ledger_meta, role):
         if common != ledger_meta.get("engine_resolved_config_sha256") or \
                 common != ledger_meta.get("common_config_sha256"):
             return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:config_binding" % role]
+        if artifact.get("invocation_id") != ledger_meta.get("gpu01_invocation_id"):
+            return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:invocation_binding" % role]
+        if artifact.get("fork_protocol_sha256") != ledger_meta.get("engine_fork_protocol_sha256"):
+            return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:fork_protocol_binding" % role]
         if ledger_meta.get("prelaunch_artifact_sha256") != want:
             return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:ledger_archive_sha" % role]
     except Exception:
@@ -533,6 +543,27 @@ def validate_pair(factual_log, cf_log, pair_manifest,
         for role_key, meta_r in ((factual_role, fm), (cf_role, cm)):
             spec = (m.get("artifacts") or {}).get(role_key + "_prelaunch")
             reasons.extend(_validate_prelaunch_artifact(spec, m, meta_r, role_key))
+        # Fork protocol is role-specific by design: capture vs restore must differ,
+        # while fork chunk is shared and common causal config is equal above.
+        try:
+            import gpu01_fork_protocol as _fp
+            for role_key, meta_r in ((factual_role, fm), (cf_role, cm)):
+                spec = (m.get("artifacts") or {}).get(role_key + "_prelaunch")
+                with open(spec["path"], "r", encoding="utf-8") as fh:
+                    artifact = json.load(fh)
+                protocol = artifact.get("canonical_fork_protocol")
+                semantic = (protocol or {}).get("semantic")
+                if not isinstance(semantic, dict) or semantic.get("role") != role_key or \
+                        semantic.get("fork_chunk") != fork_chunk or \
+                        semantic.get("mode") != ("capture" if role_key == factual_role else "restore"):
+                    reasons.append("GPU01_FORK_PROTOCOL_INVALID:%s" % role_key)
+                if role_key == factual_role and not (protocol.get("operational") or {}).get("out_dir"):
+                    reasons.append("GPU01_FORK_PROTOCOL_INVALID:%s:out_dir" % role_key)
+                if role_key == cf_role and (not (protocol.get("operational") or {}).get("sidecar") or
+                                            not (protocol.get("operational") or {}).get("parent_state_digest")):
+                    reasons.append("GPU01_FORK_PROTOCOL_INVALID:%s:restore_evidence" % role_key)
+        except Exception:
+            reasons.append("GPU01_FORK_PROTOCOL_INVALID:load")
 
     # -- lazy-meta rewrite failure marker (condition 4/E) ----------------------
     for role_key, parsed in ((factual_role, F), (cf_role, C)):

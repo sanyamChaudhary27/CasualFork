@@ -1,6 +1,6 @@
 diff --git a/evoke/gpu01_config_identity.py b/evoke/gpu01_config_identity.py
 new file mode 100644
-index 0000000..30ebc3f
+index 0000000..8ce4382
 --- /dev/null
 +++ b/evoke/gpu01_config_identity.py
 @@ -0,0 +1,71 @@
@@ -42,7 +42,7 @@ index 0000000..30ebc3f
 +# Audited environment inputs that can alter execution or strict control flow.
 +STRICT_ENV_KEYS = (
 +    "EVOKE_WARP_SEED", "EVOKE_STRICT_BASE_SEED", "EVOKE_STRICT_LAUNCH",
-+    "EVOKE_STRICT_FORK_JSON", "EVOKE_CPU_THREADS", "EVOKE_INFER_DEBUG",
++    "EVOKE_CPU_THREADS", "EVOKE_INFER_DEBUG",
 +    "EVOKE_INFER_PROGRESS", "GEO_HIST_MAX_FRAMES", "OMP_NUM_THREADS",
 +    "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "CUDA_VISIBLE_DEVICES",
 +    "CUBLAS_WORKSPACE_CONFIG", "PYTORCH_CUDA_ALLOC_CONF",
@@ -75,6 +75,70 @@ index 0000000..30ebc3f
 +    """SHA-256 of :func:`canonical_gpu01_config`'s canonical JSON."""
 +    return hashlib.sha256(_json(canonical_gpu01_config(
 +        resolved_args, strict_env)).encode("utf-8")).hexdigest()
+diff --git a/evoke/gpu01_fork_protocol.py b/evoke/gpu01_fork_protocol.py
+new file mode 100644
+index 0000000..3354c1d
+--- /dev/null
++++ b/evoke/gpu01_fork_protocol.py
+@@ -0,0 +1,58 @@
++"""Canonical role-specific GPU-01 fork protocol, shared with patched EVOKE."""
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++
++SCHEMA = "causalfork/gpu01-fork-protocol@1"
++
++
++def _json(value):
++    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
++
++
++def load_gpu01_fork_json(value):
++    """Parse inline JSON or a JSON file exactly as the engine does."""
++    if isinstance(value, dict):
++        obj = value
++    elif isinstance(value, str) and value.lstrip().startswith("{"):
++        obj = json.loads(value)
++    elif isinstance(value, str):
++        with open(value, "r", encoding="utf-8") as fh:
++            obj = json.load(fh)
++    else:
++        raise ValueError("FORK_JSON_REQUIRED")
++    if not isinstance(obj, dict):
++        raise ValueError("FORK_JSON_OBJECT_REQUIRED")
++    return obj
++
++
++def canonical_gpu01_fork_protocol(fork_cfg, role):
++    cfg = load_gpu01_fork_json(fork_cfg)
++    mode = cfg.get("mode")
++    semantic = {"role": role, "fork_chunk": cfg.get("fork_chunk"), "mode": mode}
++    operational = {}
++    if role == "factual" and mode == "capture":
++        operational["out_dir"] = cfg.get("out_dir")
++    elif role == "counterfactual" and mode == "restore":
++        operational["sidecar"] = cfg.get("sidecar")
++        operational["parent_state_digest"] = cfg.get("parent_state_digest")
++    else:
++        raise ValueError("FORK_ROLE_MODE_INVALID")
++    if not isinstance(semantic["fork_chunk"], int):
++        raise ValueError("FORK_CHUNK_REQUIRED")
++    if role == "factual" and not operational["out_dir"]:
++        raise ValueError("FORK_CAPTURE_OUT_DIR_REQUIRED")
++    if role == "counterfactual":
++        if not operational["sidecar"]:
++            raise ValueError("FORK_RESTORE_SIDECAR_REQUIRED")
++        if not operational["parent_state_digest"]:
++            raise ValueError("FORK_RESTORE_PARENT_STATE_DIGEST_REQUIRED")
++    return {"schema": SCHEMA, "semantic": semantic, "operational": operational}
++
++
++def gpu01_fork_protocol_sha256(fork_cfg, role):
++    # Operational paths intentionally do not define semantic protocol identity.
++    protocol = canonical_gpu01_fork_protocol(fork_cfg, role)
++    return hashlib.sha256(_json({"schema": SCHEMA, "semantic": protocol["semantic"]}).encode("utf-8")).hexdigest()
 diff --git a/evoke/modules/geometric_state/da3_cloud.py b/evoke/modules/geometric_state/da3_cloud.py
 index 4ebc620..33245ff 100644
 --- a/evoke/modules/geometric_state/da3_cloud.py
@@ -253,10 +317,10 @@ index 5d77a43..ddd9522 100644
              _t_diff_s = None
 diff --git a/evoke/strict_fork.py b/evoke/strict_fork.py
 new file mode 100644
-index 0000000..c35e177
+index 0000000..4202fd6
 --- /dev/null
 +++ b/evoke/strict_fork.py
-@@ -0,0 +1,1393 @@
+@@ -0,0 +1,1406 @@
 +"""CausalFork SC1 strict-coupling instrumentation V2 (+ FINAL CPU ROUND adapter).
 +
 +ADDED BY PATCH evoke-74d26851-strict-coupling (STAGE-B/C fix round + FINAL CPU
@@ -364,8 +428,10 @@ index 0000000..c35e177
 +
 +try:  # Applied EVOKE tree; the fallback keeps source-level CPU tests standalone.
 +    from . import gpu01_config_identity as _gpu01_identity
++    from . import gpu01_fork_protocol as _gpu01_fork_protocol
 +except ImportError:  # pragma: no cover - exercised by harness source loader
 +    import gpu01_config_identity as _gpu01_identity
++    import gpu01_fork_protocol as _gpu01_fork_protocol
 +
 +PATCH_TARGET_PIN = "74d268516d95c8fceadd2378f91a73f9f187042b"
 +PATCH_ID = "evoke-74d26851-strict-coupling"
@@ -474,6 +540,12 @@ index 0000000..c35e177
 +    path = env.get(ENV_PRELAUNCH_ARTIFACT)
 +    if not path:
 +        raise RuntimeError("GPU01_PRELAUNCH_EVIDENCE_MISSING")
++    role = env.get(ENV_BRANCH)
++    invocation_id = env.get("EVOKE_GPU01_INVOCATION_ID")
++    protocol = _gpu01_fork_protocol.canonical_gpu01_fork_protocol(env.get("EVOKE_STRICT_FORK_JSON"), role)
++    protocol_sha = _gpu01_fork_protocol.gpu01_fork_protocol_sha256(env.get("EVOKE_STRICT_FORK_JSON"), role)
++    if not invocation_id or env.get("EVOKE_GPU01_FORK_PROTOCOL_SHA256") != protocol_sha:
++        raise RuntimeError("GPU01_ENGINE_FORK_PROTOCOL_MISMATCH")
 +    try:
 +        want_file_sha = env.get(ENV_PRELAUNCH_ARTIFACT_SHA)
 +        got_file_sha = _file_sha256(path)
@@ -489,10 +561,11 @@ index 0000000..c35e177
 +            "patch_sha256": env.get(ENV_PATCH_SHA),
 +            "profile_sha256": env.get(ENV_PROFILE_SHA),
 +            "common_config_sha256": actual,
++            "invocation_id": invocation_id, "fork_protocol_sha256": protocol_sha,
 +        }
 +        if any(artifact.get(key) != value for key, value in expected.items()):
 +            raise ValueError("artifact identity")
-+        if artifact.get("canonical_config") != config or \
++        if artifact.get("canonical_config") != config or artifact.get("canonical_fork_protocol") != protocol or \
 +                artifact.get("argv_sha256") != hashlib.sha256(json.dumps(
 +                    artifact.get("argv"), sort_keys=True, separators=(",", ":"),
 +                    ensure_ascii=True).encode("utf-8")).hexdigest() or \
@@ -504,7 +577,8 @@ index 0000000..c35e177
 +    except Exception as exc:
 +        raise RuntimeError("GPU01_PRELAUNCH_EVIDENCE_MISSING:%s" %
 +                           type(exc).__name__)
-+    _ENGINE_ATTESTATION = {"config_sha256": actual,
++    _ENGINE_ATTESTATION = {"config_sha256": actual, "fork_protocol_sha256": protocol_sha,
++                            "invocation_id": invocation_id,
 +                           "prelaunch_artifact_sha256": got_file_sha}
 +    return dict(_ENGINE_ATTESTATION)
 +
@@ -800,6 +874,9 @@ index 0000000..c35e177
 +        "common_config_sha256": os.environ.get(ENV_CONFIG_SHA) or "UNDECLARED",
 +        "engine_resolved_config_sha256":
 +            (_ENGINE_ATTESTATION or {}).get("config_sha256", "UNDECLARED"),
++        "engine_fork_protocol_sha256":
++            (_ENGINE_ATTESTATION or {}).get("fork_protocol_sha256", "UNDECLARED"),
++        "gpu01_invocation_id": (_ENGINE_ATTESTATION or {}).get("invocation_id"),
 +        "prelaunch_artifact_sha256":
 +            (_ENGINE_ATTESTATION or {}).get("prelaunch_artifact_sha256"),
 +        "fork_chunk": _safe_meta_int(cfg),

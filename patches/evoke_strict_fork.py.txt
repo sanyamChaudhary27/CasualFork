@@ -105,8 +105,10 @@ import torch
 
 try:  # Applied EVOKE tree; the fallback keeps source-level CPU tests standalone.
     from . import gpu01_config_identity as _gpu01_identity
+    from . import gpu01_fork_protocol as _gpu01_fork_protocol
 except ImportError:  # pragma: no cover - exercised by harness source loader
     import gpu01_config_identity as _gpu01_identity
+    import gpu01_fork_protocol as _gpu01_fork_protocol
 
 PATCH_TARGET_PIN = "74d268516d95c8fceadd2378f91a73f9f187042b"
 PATCH_ID = "evoke-74d26851-strict-coupling"
@@ -215,6 +217,12 @@ def attest_engine_config(resolved_args, environ=None):
     path = env.get(ENV_PRELAUNCH_ARTIFACT)
     if not path:
         raise RuntimeError("GPU01_PRELAUNCH_EVIDENCE_MISSING")
+    role = env.get(ENV_BRANCH)
+    invocation_id = env.get("EVOKE_GPU01_INVOCATION_ID")
+    protocol = _gpu01_fork_protocol.canonical_gpu01_fork_protocol(env.get("EVOKE_STRICT_FORK_JSON"), role)
+    protocol_sha = _gpu01_fork_protocol.gpu01_fork_protocol_sha256(env.get("EVOKE_STRICT_FORK_JSON"), role)
+    if not invocation_id or env.get("EVOKE_GPU01_FORK_PROTOCOL_SHA256") != protocol_sha:
+        raise RuntimeError("GPU01_ENGINE_FORK_PROTOCOL_MISMATCH")
     try:
         want_file_sha = env.get(ENV_PRELAUNCH_ARTIFACT_SHA)
         got_file_sha = _file_sha256(path)
@@ -230,10 +238,11 @@ def attest_engine_config(resolved_args, environ=None):
             "patch_sha256": env.get(ENV_PATCH_SHA),
             "profile_sha256": env.get(ENV_PROFILE_SHA),
             "common_config_sha256": actual,
+            "invocation_id": invocation_id, "fork_protocol_sha256": protocol_sha,
         }
         if any(artifact.get(key) != value for key, value in expected.items()):
             raise ValueError("artifact identity")
-        if artifact.get("canonical_config") != config or \
+        if artifact.get("canonical_config") != config or artifact.get("canonical_fork_protocol") != protocol or \
                 artifact.get("argv_sha256") != hashlib.sha256(json.dumps(
                     artifact.get("argv"), sort_keys=True, separators=(",", ":"),
                     ensure_ascii=True).encode("utf-8")).hexdigest() or \
@@ -245,7 +254,8 @@ def attest_engine_config(resolved_args, environ=None):
     except Exception as exc:
         raise RuntimeError("GPU01_PRELAUNCH_EVIDENCE_MISSING:%s" %
                            type(exc).__name__)
-    _ENGINE_ATTESTATION = {"config_sha256": actual,
+    _ENGINE_ATTESTATION = {"config_sha256": actual, "fork_protocol_sha256": protocol_sha,
+                            "invocation_id": invocation_id,
                            "prelaunch_artifact_sha256": got_file_sha}
     return dict(_ENGINE_ATTESTATION)
 
@@ -541,6 +551,9 @@ def _ensure_meta_line():
         "common_config_sha256": os.environ.get(ENV_CONFIG_SHA) or "UNDECLARED",
         "engine_resolved_config_sha256":
             (_ENGINE_ATTESTATION or {}).get("config_sha256", "UNDECLARED"),
+        "engine_fork_protocol_sha256":
+            (_ENGINE_ATTESTATION or {}).get("fork_protocol_sha256", "UNDECLARED"),
+        "gpu01_invocation_id": (_ENGINE_ATTESTATION or {}).get("invocation_id"),
         "prelaunch_artifact_sha256":
             (_ENGINE_ATTESTATION or {}).get("prelaunch_artifact_sha256"),
         "fork_chunk": _safe_meta_int(cfg),

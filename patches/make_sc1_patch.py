@@ -44,6 +44,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PATCH_OUT = os.path.join(HERE, "evoke-74d26851-strict-coupling.patch")
 SF_SRC = os.path.join(HERE, "evoke_strict_fork.py.txt")
 CONFIG_ID_SRC = os.path.join(HERE, os.pardir, "harness", "gpu01_config_identity.py")
+FORK_PROTOCOL_SRC = os.path.join(HERE, os.pardir, "harness", "gpu01_fork_protocol.py")
 
 PIN = "74d268516d95c8fceadd2378f91a73f9f187042b"
 
@@ -51,6 +52,7 @@ PIPELINE = os.path.join("evoke", "pipelines", "pipeline_evoke.py")
 DA3CLOUD = os.path.join("evoke", "modules", "geometric_state", "da3_cloud.py")
 STRICT_FORK_REL = os.path.join("evoke", "strict_fork.py")
 CONFIG_ID_REL = os.path.join("evoke", "gpu01_config_identity.py")
+FORK_PROTOCOL_REL = os.path.join("evoke", "gpu01_fork_protocol.py")
 
 # --- edits: (file, label, anchor, replacement) ---------------------------------
 IMPORT_SF = (
@@ -264,10 +266,15 @@ def apply_edits():
             open(os.path.join(WK, CONFIG_ID_REL), "rb").read():
         raise SystemExit("canonical GPU-01 identity source was not copied byte-identically")
     print("[new ] %s (%d lines; byte-identical canonical source)" %
-          (CONFIG_ID_REL, config_id.count("\n")))
+           (CONFIG_ID_REL, config_id.count("\n")))
+    fork_protocol = open(FORK_PROTOCOL_SRC, "r", encoding="utf-8").read().replace("\r\n", "\n")
+    if not fork_protocol.endswith("\n"):
+        fork_protocol += "\n"
+    with open(os.path.join(WK, FORK_PROTOCOL_REL), "w", encoding="utf-8", newline="") as fh:
+        fh.write(fork_protocol)
     tmp = tempfile.mkdtemp(prefix="sc1-pyc-")
     try:
-        for i, rel in enumerate((PIPELINE, DA3CLOUD, STRICT_FORK_REL, CONFIG_ID_REL,
+        for i, rel in enumerate((PIPELINE, DA3CLOUD, STRICT_FORK_REL, CONFIG_ID_REL, FORK_PROTOCOL_REL,
                                  os.path.join("scripts", "inference", "infer_single.py"))):
             py_compile.compile(os.path.join(WK, rel), cfile=os.path.join(tmp, "c%d.pyc" % i), doraise=True)
             print("[pyOK] %s" % rel)
@@ -353,7 +360,7 @@ def verify_patch():
     run(["git", "-c", "core.autocrlf=false", "apply", PATCH_OUT], cwd=FRESH)
     import filecmp
     bad = []
-    for rel in (PIPELINE, DA3CLOUD, STRICT_FORK_REL, CONFIG_ID_REL,
+    for rel in (PIPELINE, DA3CLOUD, STRICT_FORK_REL, CONFIG_ID_REL, FORK_PROTOCOL_REL,
                 os.path.join("scripts", "inference", "infer_single.py")):
         if not filecmp.cmp(os.path.join(FRESH, rel), os.path.join(WK, rel), shallow=False):
             bad.append(rel)
@@ -363,6 +370,8 @@ def verify_patch():
     copied = open(os.path.join(FRESH, CONFIG_ID_REL), "rb").read()
     if source != copied:
         raise SystemExit("applied canonical GPU-01 identity source differs from harness source")
+    if open(FORK_PROTOCOL_SRC, "rb").read().replace(b"\r\n", b"\n") != open(os.path.join(FRESH, FORK_PROTOCOL_REL), "rb").read():
+        raise SystemExit("applied canonical GPU-01 fork protocol source differs from harness source")
     print("[verify] applied FRESH == edited WORK byte-for-byte; canonical identity copy verified")
 
 

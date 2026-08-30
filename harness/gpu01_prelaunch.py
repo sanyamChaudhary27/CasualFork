@@ -139,8 +139,9 @@ def validate_prelaunch(manifest, patch_path, profile_path, evoke_pin_path,
             "flash_attn": probe}
 
 
-def write_artifact(path, report):
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+def write_artifact(path, report, exclusive=False):
+    mode = "x" if exclusive else "w"
+    with open(path, mode, encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n")
 
 
