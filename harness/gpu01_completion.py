@@ -17,6 +17,13 @@ def sha256(path):
             h.update(block)
     return h.hexdigest()
 
+def normalized(path):
+    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+def engine_ledger_target(base_path, run_id):
+    stem, ext = os.path.splitext(base_path)
+    return "%s.%s%s" % (stem, run_id, ext or ".jsonl")
+
 def _meta(path):
     import strict_coupling
     parsed = strict_coupling.load_log(path)
@@ -48,7 +55,14 @@ def verify(record, manifest, role):
     events = [e for e in parsed["events"] if e.get("event") == event and e.get("chunk") == manifest.get("fork_chunk")]
     if len(events) != 1:
         return FAILED, ["CHILD_LEDGER_EVENT_MISSING"], {}
-    return COMPLETE, [], {"ledger_path": path, "ledger_sha256": sha256(path), "event": events[0]}
+    extra = {"ledger_path": normalized(path), "ledger_sha256": sha256(path), "event": events[0]}
+    if role == "factual":
+        capture, digest = events[0].get("sidecar"), events[0].get("state_digest")
+        if not capture or not os.path.exists(capture) or not digest or not os.path.exists(digest):
+            return FAILED, ["CHILD_FACTUAL_CAPTURE_EVIDENCE_MISSING"], {}
+        extra["fork_capture_sidecar"] = {"path": normalized(capture), "sha256": sha256(capture)}
+        extra["parent_state_digest"] = {"path": normalized(digest), "sha256": sha256(digest)}
+    return COMPLETE, [], extra
 
 def write(path, data):
     with open(path, "x", encoding="utf-8", newline="\n") as fh:

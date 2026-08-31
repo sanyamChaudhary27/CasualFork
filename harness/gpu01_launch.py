@@ -126,7 +126,13 @@ def launch(pair_manifest_path, patch_path, profile_path, evoke_pin, artifact_pat
             raise ValueError("PRELAUNCH_ALREADY_BOUND")
         if os.path.exists(artifact_path):
             raise ValueError("PRELAUNCH_ARTIFACT_EXISTS")
+        if os.path.exists(artifact_path + ".completion.json"):
+            raise ValueError("COMPLETION_ARTIFACT_EXISTS")
         resolved_args = resolver(list(child_argv), evoke_pin)
+        base_ledger = env.get("EVOKE_STRICT_LEDGER_PATH")
+        declared_ledger = ((manifest.get("artifacts") or {}).get(role + "_log") or {}).get("path")
+        if not base_ledger or not declared_ledger or completion.normalized(completion.engine_ledger_target(base_ledger, run_id)) != completion.normalized(declared_ledger):
+            raise ValueError("ENGINE_LEDGER_TARGET_MISMATCH")
         env["EVOKE_STRICT_PATCH_SHA256"] = prelaunch.file_sha256(patch_path)
         env["EVOKE_STRICT_PROFILE_SHA256"] = prelaunch.file_sha256(profile_path)
         env["EVOKE_STRICT_PAIR_ID"] = pair_id
@@ -191,6 +197,9 @@ def launch(pair_manifest_path, patch_path, profile_path, evoke_pin, artifact_pat
         artifacts[role + "_completion"] = {"path": completion_path,
                                               "sha256": completion.sha256(completion_path),
                                               "invocation_id": invocation_id}
+        if role == "factual":
+            artifacts["factual_fork_capture"] = completion_record["fork_capture_sidecar"]
+            manifest["parent_state_digest"] = completion_record["parent_state_digest"]
         _bind_artifact(pair_manifest_path, manifest, role, artifact_path, artifact_sha, invocation_id, protocol_sha)
     return record
 
