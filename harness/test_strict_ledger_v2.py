@@ -29,6 +29,7 @@ import env_fingerprint as ef          # noqa: E402
 import gpu01_prelaunch as gp          # noqa: E402
 import gpu01_config_identity as gci   # noqa: E402
 import gpu01_launch as gl             # noqa: E402
+import gpu01_completion as completion # noqa: E402
 
 RESULTS = []
 
@@ -2095,6 +2096,63 @@ def t_seq9():
 @case("SEQ10 normal sequential path has no RUN_IDS_NOT_FRESH")
 def t_seq10():
     with tempfile.TemporaryDirectory() as td: assert "RUN_IDS_NOT_FRESH" not in gp.validate_role_freshness(_seq_manifest(td,True)[0], "counterfactual")
+    return True
+
+
+def _comp1_fixture(td):
+    patch, profile = os.path.join(td,"p"), os.path.join(td,"profile")
+    open(patch,"w").write("p"); open(profile,"w").write("q")
+    base=os.path.join(td,"factual.jsonl"); target=completion.engine_ledger_target(base,"run-F")
+    args={"seed":7,"height":1}; env={"EVOKE_WARP_SEED":"1","EVOKE_STRICT_BASE_SEED":"7"}
+    man={"pair_id":"p","run_ids":{"factual":"run-F","counterfactual":"run-C"},"launch_strict":True,
+         "patch_sha256":gp.file_sha256(patch),"profile_sha256":gp.file_sha256(profile),"common_config_sha256":gci.gpu01_config_sha256(args,dict(env,EVOKE_STRICT_LAUNCH="1")),"fork_chunk":1,
+         "artifacts":{"factual_log":{"path":target},"counterfactual_log":{"path":os.path.join(td,"c.jsonl")}}}
+    mp=os.path.join(td,"m.json"); json.dump(man,open(mp,"w")); return mp,patch,profile,args,env,target
+
+def _run_comp(td, kind):
+    mp,p,q,args,env,target=_comp1_fixture(td); old=gl.sc1_preflight.preflight; gl.sc1_preflight.preflight=lambda *_a,**_k:{"status":"PASS","aborts":[]}
+    def valid(manifest, pp, qq, pin, env, **kw): return gp.validate_prelaunch(manifest,pp,qq,pin,env=env,experiment_id="GPU-01",proposal_id="GPU-01",config_sha=env["EVOKE_STRICT_CONFIG_SHA256"],pin_resolver=lambda _:gp.PIN,flash_probe=lambda:{"status":"PASS"},fingerprint=lambda **x:{})
+    def runner(_a,env,**_k):
+        if kind != "missing":
+            side=os.path.join(td,"cap"); dig=os.path.join(td,"parent"); open(side,"w").write("s"); open(dig,"w").write("d")
+            meta={"event":"meta","pair_id":"p","run_id":"run-F","branch_id":"factual","gpu01_invocation_id":env["EVOKE_GPU01_INVOCATION_ID"] if kind!="badinv" else "bad","prelaunch_artifact_sha256":env["EVOKE_GPU01_PRELAUNCH_ARTIFACT_SHA256"] if kind!="badpre" else "bad","common_config_sha256":env["EVOKE_STRICT_CONFIG_SHA256"],"engine_resolved_config_sha256":env["EVOKE_STRICT_CONFIG_SHA256"],"engine_fork_protocol_sha256":env["EVOKE_GPU01_FORK_PROTOCOL_SHA256"]}
+            ev={"event":"FORK_CAPTURE","chunk":1,"sidecar":side,"state_digest":dig}
+            open(target,"w").write(json.dumps(meta)+"\n"+json.dumps(ev)+"\n")
+        return 1 if kind=="nonzero" else 0
+    try:
+        r=gl.launch(mp,p,q,td,os.path.join(td,"pre"),["python","infer_single.py"],env=dict(env,EVOKE_STRICT_PAIR_ID="p",EVOKE_STRICT_RUN_ID="run-F",EVOKE_STRICT_BRANCH_ID="factual",EVOKE_STRICT_LEDGER_PATH=os.path.join(td,"factual.jsonl"),EVOKE_STRICT_FORK_JSON=json.dumps({"fork_chunk":1,"mode":"capture","out_dir":td})),resolver=lambda *_:args,validator=valid,runner=runner)
+    finally: gl.sc1_preflight.preflight=old
+    return r,mp,target
+
+@case("COMP1 child nonzero completion failed")
+def t_comp1():
+    with tempfile.TemporaryDirectory() as td: r,_,_= _run_comp(td,"nonzero"); assert r["completion_status"]==completion.FAILED
+    return True
+@case("COMP2 absent ledger completion failed")
+def t_comp2():
+    with tempfile.TemporaryDirectory() as td: r,_,_= _run_comp(td,"missing"); assert r["completion_status"]==completion.FAILED
+    return True
+@case("COMP3 wrong invocation completion failed")
+def t_comp3():
+    with tempfile.TemporaryDirectory() as td: r,_,_= _run_comp(td,"badinv"); assert r["completion_status"]==completion.FAILED
+    return True
+@case("COMP4 wrong prelaunch completion failed")
+def t_comp4():
+    with tempfile.TemporaryDirectory() as td: r,_,_= _run_comp(td,"badpre"); assert r["completion_status"]==completion.FAILED
+    return True
+@case("COMP5 valid factual completion finalizes manifest")
+def t_comp5():
+    with tempfile.TemporaryDirectory() as td:
+        r,mp,target=_run_comp(td,"ok"); m=json.load(open(mp)); assert r["completion_status"]==completion.COMPLETE and m["artifacts"]["factual_log"]["sha256"]==completion.sha256(target) and m["artifacts"]["factual_completion"]
+    return True
+@case("COMP17 ledger target mismatch refuses")
+def t_comp17(): assert completion.engine_ledger_target("/x/f.jsonl","run-F")=="/x/f.run-F.jsonl" and completion.engine_ledger_target("/x/f","run-F")=="/x/f.run-F.jsonl"; return True
+@case("COMP18 stale completion path refuses")
+def t_comp18():
+    with tempfile.TemporaryDirectory() as td:
+        mp,p,q,args,env,target=_comp1_fixture(td); pre=os.path.join(td,"pre"); open(pre+".completion.json","w").write("old")
+        r=gl.launch(mp,p,q,td,pre,["python","infer_single.py"],env=dict(env,EVOKE_STRICT_PAIR_ID="p",EVOKE_STRICT_RUN_ID="run-F",EVOKE_STRICT_BRANCH_ID="factual"),resolver=lambda *_:args,runner=lambda *_a,**_k:(_ for _ in ()).throw(AssertionError()))
+        assert "COMPLETION_ARTIFACT_EXISTS" in r["reasons"]
     return True
 
 

@@ -157,7 +157,8 @@ def launch(pair_manifest_path, patch_path, profile_path, evoke_pin, artifact_pat
                                config_sha=config_sha)
     except Exception as exc:
         report = {"status": prelaunch.GPU01_PRELAUNCH_REFUSED,
-                  "reasons": ["LAUNCH_RESOLUTION_FAILED:%s" % type(exc).__name__]}
+                  "reasons": [str(exc) if isinstance(exc, ValueError) else
+                              "LAUNCH_RESOLUTION_FAILED:%s" % type(exc).__name__]}
     record = _artifact(report, manifest, resolved_args, env, child_argv, patch_path,
                        profile_path, pair_id, run_id, role, invocation_id, protocol, protocol_sha)
     if os.path.exists(artifact_path):
