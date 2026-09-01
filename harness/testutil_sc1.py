@@ -475,6 +475,9 @@ def make_gpu01_strict_pair(tmpdir, fork_chunk=1):
                              "parent_state_digest": man["parent_state_digest"]["path"]},
     }
     invocation_ids = {"factual": uuid.uuid4().hex, "counterfactual": uuid.uuid4().hex}
+    capture = os.path.join(tmpdir, "capture.json")
+    with open(capture, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("{\"capture\":true}\n")
     for role, path in (("factual", fp), ("counterfactual", cp)):
         protocol = gfp.canonical_gpu01_fork_protocol(configs[role], role)
         protocol_sha = gfp.gpu01_fork_protocol_sha256(configs[role], role)
@@ -497,6 +500,12 @@ def make_gpu01_strict_pair(tmpdir, fork_chunk=1):
                            common_config_sha256=identity, engine_resolved_config_sha256=identity,
                            engine_fork_protocol_sha256=protocol_sha, gpu01_invocation_id=invocation_ids[role],
                            prelaunch_artifact_sha256=ah)
+            elif obj.get("event") == "FORK_CAPTURE":
+                obj.update(sidecar=capture, state_digest=man["parent_state_digest"]["path"])
+            elif obj.get("event") == GENERATOR_STATE_RESTORED:
+                obj.update(sidecar=capture,
+                           state_digest_parent=man["parent_state_digest"]["path"],
+                           state_digest_child=man["child_state_digest"]["path"])
         with open(path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("\n".join(json.dumps(obj, sort_keys=True) for obj in objs) + "\n")
         man["artifacts"][role + "_log"] = file_art(path)
@@ -505,4 +514,29 @@ def make_gpu01_strict_pair(tmpdir, fork_chunk=1):
                                                      "fork_protocol_sha256": protocol_sha}
         man["invocation_ids"][role] = invocation_ids[role]
         man["fork_protocol_sha256"][role] = protocol_sha
+    # These are deliberately generated through the completion implementation,
+    # so launch-strict fixtures exercise the same provenance verifier as a
+    # wrapper-finalized CPU run.
+    import gpu01_completion as completion
+    for role in ("factual", "counterfactual"):
+        pre = man["artifacts"][role + "_prelaunch"]
+        record = {"child_returncode": 0, "pair_id": man["pair_id"],
+                  "run_id": man["run_ids"][role], "invocation_id": invocation_ids[role],
+                  "prelaunch_artifact_sha256": pre["sha256"],
+                  "common_config_sha256": identity,
+                  "fork_protocol_sha256": man["fork_protocol_sha256"][role]}
+        comp = completion.make(record, man, role)
+        assert comp["status"] == completion.COMPLETE
+        completion_path = os.path.join(tmpdir, role + ".completion.json")
+        completion.write(completion_path, comp)
+        man["artifacts"][role + "_completion"] = {
+            "path": completion_path, "sha256": completion.sha256(completion_path),
+            "invocation_id": invocation_ids[role]}
+    # Use the independently verified records rather than a fixture-only digest
+    # declaration, mirroring gpu01_launch's finalization transaction.
+    factual_comp = completion.load_verified(man["artifacts"]["factual_completion"], man, "factual")
+    cf_comp = completion.load_verified(man["artifacts"]["counterfactual_completion"], man, "counterfactual")
+    man["artifacts"]["factual_fork_capture"] = factual_comp["fork_capture_sidecar"]
+    man["parent_state_digest"] = factual_comp["parent_state_digest"]
+    man["child_state_digest"] = cf_comp["child_state_digest"]
     return fp, cp, man, args, env

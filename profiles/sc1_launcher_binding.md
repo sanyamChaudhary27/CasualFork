@@ -69,6 +69,18 @@ pair/run/role/pin/patch/profile/config identities, and requires
 `prelaunch.common_config_sha256 == ledger.engine_resolved_config_sha256 ==
 ledger.common_config_sha256 == manifest.common_config_sha256`.
 
+After each zero-exit child, the wrapper writes an immutable
+`GPU01_CHILD_COMPLETE` completion artifact and binds it as
+`artifacts.factual_completion` or `artifacts.counterfactual_completion`. The
+factual completion independently hashes its emitted ledger, `FORK_CAPTURE`
+sidecar, and parent state digest. Counterfactual launch is refused until that
+factual completion verifies. Its `GENERATOR_STATE_RESTORED` completion must
+name and hash the exact factual sidecar and parent digest, and must hash its
+own child state digest. The counterfactual finalization binds that child digest
+to `manifest.child_state_digest`. In launch-strict mode the pair validator
+rehashes and re-verifies both completion files and this factual→counterfactual
+provenance before it can return `STRICT_NOISE_COUPLED`.
+
 ## 3. GPU-01 prelaunch guard
 
 Run only the mandatory wrapper, with an exact argv list, before importing EVOKE

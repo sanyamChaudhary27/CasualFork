@@ -131,7 +131,7 @@ def validate_prelaunch(manifest, patch_path, profile_path, evoke_pin_path,
                        env=None, experiment_id=None, proposal_id=None,
                        pin_resolver=pin_revision, flash_probe=flash_attn_preflight.probe,
                        torch_module=None, fingerprint=env_fingerprint.fingerprint,
-                       run_id_is_fresh=None, config_sha=None):
+                       config_sha=None):
     """Return one guard report; collaborators may inject every external probe."""
     env = dict(os.environ if env is None else env)
     reasons = []

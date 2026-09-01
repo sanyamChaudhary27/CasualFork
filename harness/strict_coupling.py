@@ -236,6 +236,10 @@ def check_manifest(m):
             if (m.get("invocation_ids") or {}).get(role) != spec.get("invocation_id") or \
                     (m.get("fork_protocol_sha256") or {}).get(role) != spec.get("fork_protocol_sha256"):
                 return ["GPU01_PRELAUNCH_EVIDENCE_MISSING:%s:manifest_binding" % key]
+            completion = arts.get(role + "_completion")
+            if not isinstance(completion, dict) or not completion.get("path") or \
+                    not _is_sha256(completion.get("sha256")):
+                return ["GPU01_COMPLETION_EVIDENCE_MISSING:%s" % role]
     return []
 
 
@@ -543,6 +547,22 @@ def validate_pair(factual_log, cf_log, pair_manifest,
         for role_key, meta_r in ((factual_role, fm), (cf_role, cm)):
             spec = (m.get("artifacts") or {}).get(role_key + "_prelaunch")
             reasons.extend(_validate_prelaunch_artifact(spec, m, meta_r, role_key))
+        # Completion files are independently hashed and revalidated here rather
+        # than trusted because the wrapper happened to bind their paths.
+        try:
+            import gpu01_completion as _completion
+            factual_completion = _completion.load_verified(
+                (m.get("artifacts") or {}).get(factual_role + "_completion"), m, factual_role)
+            cf_completion = _completion.load_verified(
+                (m.get("artifacts") or {}).get(cf_role + "_completion"), m, cf_role)
+            if cf_completion.get("factual_fork_capture") != factual_completion.get("fork_capture_sidecar") or \
+                    cf_completion.get("parent_state_digest") != factual_completion.get("parent_state_digest"):
+                reasons.append("GPU01_COMPLETION_PROVENANCE_INVALID")
+            if m.get("parent_state_digest") != factual_completion.get("parent_state_digest") or \
+                    m.get("child_state_digest") != cf_completion.get("child_state_digest"):
+                reasons.append("GPU01_COMPLETION_DIGEST_BINDING_INVALID")
+        except Exception:
+            reasons.append("GPU01_COMPLETION_EVIDENCE_INVALID")
         # Fork protocol is role-specific by design: capture vs restore must differ,
         # while fork chunk is shared and common causal config is equal above.
         try:

@@ -62,6 +62,29 @@ def verify(record, manifest, role):
             return FAILED, ["CHILD_FACTUAL_CAPTURE_EVIDENCE_MISSING"], {}
         extra["fork_capture_sidecar"] = {"path": normalized(capture), "sha256": sha256(capture)}
         extra["parent_state_digest"] = {"path": normalized(digest), "sha256": sha256(digest)}
+    else:
+        # The engine writes these names at the real restore boundary.  Do not
+        # accept an event marker alone: it must prove which factual capture was
+        # restored and preserve the child boundary digest for the pair verdict.
+        try:
+            factual = load_verified((manifest.get("artifacts") or {}).get("factual_completion"),
+                                    manifest, "factual")
+            capture = events[0].get("sidecar")
+            parent = events[0].get("state_digest_parent")
+            child = events[0].get("state_digest_child")
+            if not all(isinstance(x, str) and os.path.exists(x)
+                       for x in (capture, parent, child)):
+                raise ValueError("missing restore artifacts")
+            if normalized(capture) != factual["fork_capture_sidecar"]["path"] or \
+                    sha256(capture) != factual["fork_capture_sidecar"]["sha256"] or \
+                    normalized(parent) != factual["parent_state_digest"]["path"] or \
+                    sha256(parent) != factual["parent_state_digest"]["sha256"]:
+                raise ValueError("factual provenance mismatch")
+            extra["factual_fork_capture"] = {"path": normalized(capture), "sha256": sha256(capture)}
+            extra["parent_state_digest"] = {"path": normalized(parent), "sha256": sha256(parent)}
+            extra["child_state_digest"] = {"path": normalized(child), "sha256": sha256(child)}
+        except Exception:
+            return FAILED, ["CHILD_COUNTERFACTUAL_PROVENANCE_INVALID"], {}
     return COMPLETE, [], extra
 
 def write(path, data):
@@ -110,4 +133,13 @@ def load_verified(spec, manifest, role):
             item = obj.get(key) or {}
             if not item.get("path") or not item.get("sha256") or sha256(item["path"]) != item["sha256"]:
                 raise ValueError("COMPLETION_FACTUAL_ARTIFACT_MISMATCH")
+    else:
+        for key in ("factual_fork_capture", "parent_state_digest", "child_state_digest"):
+            item = obj.get(key) or {}
+            if not item.get("path") or not item.get("sha256") or sha256(item["path"]) != item["sha256"]:
+                raise ValueError("COMPLETION_COUNTERFACTUAL_ARTIFACT_MISMATCH")
+        factual = load_verified(artifacts.get("factual_completion"), manifest, "factual")
+        if obj["factual_fork_capture"] != factual["fork_capture_sidecar"] or \
+                obj["parent_state_digest"] != factual["parent_state_digest"]:
+            raise ValueError("COMPLETION_COUNTERFACTUAL_PROVENANCE_MISMATCH")
     return obj

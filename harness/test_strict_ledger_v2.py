@@ -1586,8 +1586,7 @@ def t_gpu01_prelaunch():
     common = dict(experiment_id="GPU-01", proposal_id="GPU-01",
                   pin_resolver=lambda _: gp.PIN,
                   flash_probe=lambda: {"status": "PASS"}, torch_module=Torch(),
-                  fingerprint=lambda **kw: {"schema": "mock", **kw},
-                  run_id_is_fresh=lambda *_: True)
+                  fingerprint=lambda **kw: {"schema": "mock", **kw})
     report = gp.validate_prelaunch(manifest, patch, profile, "unused", env=env, **common)
     assert report["status"] == gp.GPU01_PRELAUNCH_PASS and \
         report["fingerprint"]["cudnn"] == {"benchmark": False, "deterministic": True}
@@ -1999,45 +1998,74 @@ def t_fork9():
 @case("GPU01-SEQUENTIAL-HAPPY-PATH factual then counterfactual wrapper lifecycle")
 def t_gpu01_sequential():
     with tempfile.TemporaryDirectory() as td:
-        patch, profile = os.path.join(td, "p.patch"), os.path.join(td, "p.json")
-        open(patch, "w").write("patch\n"); open(profile, "w").write("{}\n")
-        args = {"seed": 7, "height": 384, "width": 640, "prompt": "x"}
-        base_env = {"EVOKE_WARP_SEED":"77", "EVOKE_STRICT_BASE_SEED":"7"}
-        common = gci.gpu01_config_sha256(args, dict(base_env, EVOKE_STRICT_LAUNCH="1"))
-        fl, cl = os.path.join(td, "f.jsonl"), os.path.join(td, "c.jsonl")
-        man = {"pair_id":"seq-pair", "run_ids":{"factual":"seq-f","counterfactual":"seq-c"},
-               "launch_strict":True, "patch_sha256":gp.file_sha256(patch), "profile_sha256":gp.file_sha256(profile),
-               "common_config_sha256":common, "fork_chunk":1,
-               "artifacts":{"factual_log":{"path":fl}, "counterfactual_log":{"path":cl}}}
-        mp = os.path.join(td, "manifest.json"); json.dump(man, open(mp,"w"))
-        old_pf = gl.sc1_preflight.preflight
-        gl.sc1_preflight.preflight = lambda *_a, **_k: {"status":"PASS", "aborts":[]}
-        def validator(manifest, patch_path, profile_path, pin, env, **_kw):
-            return gp.validate_prelaunch(manifest, patch_path, profile_path, pin, env=env,
-                experiment_id="GPU-01", proposal_id="GPU-01", config_sha=env["EVOKE_STRICT_CONFIG_SHA256"],
-                pin_resolver=lambda _p: gp.PIN, flash_probe=lambda:{"status":"PASS"},
-                fingerprint=lambda **_x:{})
-        calls=[]
-        def runner(argv, env, **_kw):
-            path = fl if env["EVOKE_STRICT_BRANCH_ID"] == "factual" else cl
-            open(path,"w").write("ledger\n"); calls.append(env); return 0
-        try:
-            fr = gl.launch(mp, patch, profile, td, os.path.join(td,"f.pre.json"), ["python","infer_single.py"],
-                env=dict(base_env, EVOKE_STRICT_PAIR_ID="seq-pair", EVOKE_STRICT_RUN_ID="seq-f", EVOKE_STRICT_BRANCH_ID="factual",
-                         EVOKE_STRICT_FORK_JSON=json.dumps({"fork_chunk":1,"mode":"capture","out_dir":td})),
-                resolver=lambda *_: args, validator=validator, runner=runner)
-            cr = gl.launch(mp, patch, profile, td, os.path.join(td,"c.pre.json"), ["python","infer_single.py"],
-                env=dict(base_env, EVOKE_STRICT_PAIR_ID="seq-pair", EVOKE_STRICT_RUN_ID="seq-c", EVOKE_STRICT_BRANCH_ID="counterfactual",
-                         EVOKE_STRICT_FORK_JSON=json.dumps({"fork_chunk":1,"mode":"restore","sidecar":"cap.json","parent_state_digest":"state.json"})),
-                resolver=lambda *_: args, validator=validator, runner=runner)
-        finally:
-            gl.sc1_preflight.preflight = old_pf
-        final = json.load(open(mp))
-        assert fr["status"] == gp.GPU01_PRELAUNCH_PASS and cr["status"] == gp.GPU01_PRELAUNCH_PASS
-        assert len(calls) == 2 and os.path.exists(fl) and os.path.exists(cl)
-        assert final["invocation_ids"]["factual"] != final["invocation_ids"]["counterfactual"]
-        assert "factual_prelaunch" in final["artifacts"] and "counterfactual_prelaunch" in final["artifacts"]
+        fr, cr, final, fl, cl = _successful_wrapper_pair(td)
+        assert fr["completion_status"] == completion.COMPLETE
+        assert cr["completion_status"] == completion.COMPLETE
+        assert sc.validate_pair(fl, cl, final)["status"] == sc.STRICT_NOISE_COUPLED
+        assert sc.refuse_gpu_countersign(dict(final, status=sc.STRICT_NOISE_COUPLED)) is False
     return True
+
+
+def _successful_wrapper_pair(td, counterfactual=True):
+    """Produce wrapper-authored CPU evidence, including a real factual completion.
+
+    The child runner is deliberately model-free, but writes the exact ledger
+    contract an engine must emit.  Both wrapper calls, completion verification,
+    and manifest finalization remain production code.
+    """
+    patch, profile = os.path.join(td, "p.patch"), os.path.join(td, "p.json")
+    open(patch, "w").write("patch\n"); open(profile, "w").write("{}\n")
+    args = {"seed": 7, "height": 384, "width": 640, "prompt": "ordinary"}
+    base_env = {"EVOKE_WARP_SEED": "77", "EVOKE_STRICT_BASE_SEED": "7"}
+    common = gci.gpu01_config_sha256(args, dict(base_env, EVOKE_STRICT_LAUNCH="1"))
+    parent, child = tu.write_digest_pair(td)
+    capture = os.path.join(td, "capture.json"); open(capture, "w").write("{\"capture\":true}\n")
+    fbase, cbase = os.path.join(td, "factual.jsonl"), os.path.join(td, "counterfactual.jsonl")
+    fl, cl = completion.engine_ledger_target(fbase, "seq-f"), completion.engine_ledger_target(cbase, "seq-c")
+    manifest = {"schema": sc.MANIFEST_SCHEMA, "pair_id": tu.PAIR_ID,
+                "run_ids": {"factual": "seq-f", "counterfactual": "seq-c"},
+                "upstream_pin": tu.PIN, "launch_strict": True,
+                "patch_sha256": gp.file_sha256(patch), "profile_sha256": gp.file_sha256(profile),
+                "common_config_sha256": common, "fork_chunk": 1,
+                "warp_seed_sha256": tu.WARP_SEED_SHA,
+                "parent_state_digest": tu.file_art(parent), "child_state_digest": tu.file_art(child),
+                "artifacts": {"factual_log": {"path": fl}, "counterfactual_log": {"path": cl}}}
+    mp = os.path.join(td, "manifest.json"); json.dump(manifest, open(mp, "w"))
+    old = gl.sc1_preflight.preflight; gl.sc1_preflight.preflight = lambda *_a, **_k: {"status":"PASS", "aborts":[]}
+    def validator(man, pp, qq, pin, env, **_kw):
+        return gp.validate_prelaunch(man, pp, qq, pin, env=env, experiment_id="GPU-01", proposal_id="GPU-01",
+            config_sha=env["EVOKE_STRICT_CONFIG_SHA256"], pin_resolver=lambda _p: gp.PIN,
+            flash_probe=lambda: {"status":"PASS"}, fingerprint=lambda **_x: {})
+    def runner(_argv, env, **_kw):
+        role = env["EVOKE_STRICT_BRANCH_ID"]; run = env["EVOKE_STRICT_RUN_ID"]
+        meta, entries, events = tu.build_branch(role, run, fork_chunk=1)
+        meta.update(patch_sha256=gp.file_sha256(patch), profile_sha256=gp.file_sha256(profile),
+                    common_config_sha256=env["EVOKE_STRICT_CONFIG_SHA256"],
+                    engine_resolved_config_sha256=env["EVOKE_STRICT_CONFIG_SHA256"],
+                    engine_fork_protocol_sha256=env["EVOKE_GPU01_FORK_PROTOCOL_SHA256"],
+                    gpu01_invocation_id=env["EVOKE_GPU01_INVOCATION_ID"],
+                    prelaunch_artifact_sha256=env["EVOKE_GPU01_PRELAUNCH_ARTIFACT_SHA256"])
+        for event in events:
+            if role == "factual": event.update(sidecar=capture, state_digest=parent)
+            else: event.update(sidecar=capture, state_digest_parent=parent, state_digest_child=child)
+        path = fl if role == "factual" else cl
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(tu.to_jsonl(meta, entries, events))
+        return 0
+    try:
+        fr = gl.launch(mp, patch, profile, td, os.path.join(td, "f.pre.json"), ["python", "infer_single.py"],
+            env=dict(base_env, EVOKE_STRICT_PAIR_ID=tu.PAIR_ID, EVOKE_STRICT_RUN_ID="seq-f", EVOKE_STRICT_BRANCH_ID="factual",
+                     EVOKE_STRICT_LEDGER_PATH=fbase, EVOKE_STRICT_FORK_JSON=json.dumps({"fork_chunk":1,"mode":"capture","out_dir":td})),
+            resolver=lambda *_: args, validator=validator, runner=runner)
+        if not counterfactual: return fr, None, json.load(open(mp)), fl, cl
+        m = json.load(open(mp)); fc = completion.load_verified(m["artifacts"]["factual_completion"], m, "factual")
+        cr = gl.launch(mp, patch, profile, td, os.path.join(td, "c.pre.json"), ["python", "infer_single.py"],
+            env=dict(base_env, EVOKE_STRICT_PAIR_ID=tu.PAIR_ID, EVOKE_STRICT_RUN_ID="seq-c", EVOKE_STRICT_BRANCH_ID="counterfactual",
+                     EVOKE_STRICT_LEDGER_PATH=cbase, EVOKE_STRICT_FORK_JSON=json.dumps({"fork_chunk":1,"mode":"restore","sidecar":fc["fork_capture_sidecar"]["path"],"parent_state_digest":fc["parent_state_digest"]["path"]})),
+            resolver=lambda *_: args, validator=validator, runner=runner)
+        return fr, cr, json.load(open(mp)), fl, cl
+    finally:
+        gl.sc1_preflight.preflight = old
 
 
 def _seq_manifest(td, completed=False):
@@ -2057,7 +2085,11 @@ def t_seq1():
     return True
 @case("SEQ2 completed factual permits counterfactual lifecycle")
 def t_seq2():
-    with tempfile.TemporaryDirectory() as td: assert not gp.validate_role_freshness(_seq_manifest(td, True)[0], "counterfactual")
+    with tempfile.TemporaryDirectory() as td:
+        _fr, _cr, m, _fl, _cl = _successful_wrapper_pair(td, counterfactual=False)
+        fc = completion.load_verified(m["artifacts"]["factual_completion"], m, "factual")
+        cfg = {"fork_chunk":1,"mode":"restore","sidecar":fc["fork_capture_sidecar"]["path"],"parent_state_digest":fc["parent_state_digest"]["path"]}
+        assert not gp.validate_role_freshness(m, "counterfactual", json.dumps(cfg))
     return True
 @case("SEQ3 second factual launch is refused")
 def t_seq3():
@@ -2071,7 +2103,9 @@ def t_seq4():
 @case("SEQ5 counterfactual requires factual prelaunch")
 def t_seq5():
     with tempfile.TemporaryDirectory() as td:
-        m,f,_c=_seq_manifest(td); open(f,"w").write("f"); assert gp.validate_role_freshness(m,"counterfactual") == ["SIBLING_FACTUAL_PRELAUNCH_MISSING"]
+        _fr, _cr, m, _fl, _cl = _successful_wrapper_pair(td, counterfactual=False)
+        del m["artifacts"]["factual_completion"]
+        assert gp.validate_role_freshness(m,"counterfactual") == ["SIBLING_FACTUAL_COMPLETION_INVALID:ValueError"]
     return True
 @case("SEQ6 foreign factual pair archive is refused")
 def t_seq6():
@@ -2145,6 +2179,111 @@ def t_comp5():
     with tempfile.TemporaryDirectory() as td:
         r,mp,target=_run_comp(td,"ok"); m=json.load(open(mp)); assert r["completion_status"]==completion.COMPLETE and m["artifacts"]["factual_log"]["sha256"]==completion.sha256(target) and m["artifacts"]["factual_completion"]
     return True
+
+
+def _completion_record(manifest, role):
+    pre = manifest["artifacts"][role + "_prelaunch"]
+    return {"child_returncode": 0, "pair_id": manifest["pair_id"],
+            "run_id": manifest["run_ids"][role],
+            "invocation_id": manifest["invocation_ids"][role],
+            "prelaunch_artifact_sha256": pre["sha256"],
+            "common_config_sha256": manifest["common_config_sha256"],
+            "fork_protocol_sha256": manifest["fork_protocol_sha256"][role]}
+
+
+@case("COMP6 counterfactual completion requires GENERATOR_STATE_RESTORED")
+def t_comp6():
+    with tempfile.TemporaryDirectory() as td:
+        _f, _c, m, _fl, cl = _successful_wrapper_pair(td)
+        rows = lines_of(cl); rows = [x for x in rows if x.get("event") != sc.GENERATOR_STATE_RESTORED]
+        with open(cl, "w", encoding="utf-8", newline="\n") as fh: fh.write("\n".join(json.dumps(x) for x in rows) + "\n")
+        assert completion.make(_completion_record(m, "counterfactual"), m, "counterfactual")["status"] == completion.FAILED
+    return True
+
+@case("COMP7 counterfactual completion binds factual sidecar")
+def t_comp7():
+    with tempfile.TemporaryDirectory() as td:
+        _f, _c, m, _fl, cl = _successful_wrapper_pair(td)
+        rows = lines_of(cl); next(x for x in rows if x.get("event") == sc.GENERATOR_STATE_RESTORED)["sidecar"] = os.path.join(td, "wrong")
+        open(os.path.join(td, "wrong"), "w").write("wrong")
+        with open(cl, "w", encoding="utf-8", newline="\n") as fh: fh.write("\n".join(json.dumps(x) for x in rows) + "\n")
+        assert completion.make(_completion_record(m, "counterfactual"), m, "counterfactual")["status"] == completion.FAILED
+    return True
+
+@case("COMP8 counterfactual completion binds factual parent digest")
+def t_comp8():
+    with tempfile.TemporaryDirectory() as td:
+        _f, _c, m, _fl, cl = _successful_wrapper_pair(td)
+        wrong = os.path.join(td, "wrong-parent"); open(wrong, "w").write("wrong")
+        rows = lines_of(cl); next(x for x in rows if x.get("event") == sc.GENERATOR_STATE_RESTORED)["state_digest_parent"] = wrong
+        with open(cl, "w", encoding="utf-8", newline="\n") as fh: fh.write("\n".join(json.dumps(x) for x in rows) + "\n")
+        assert completion.make(_completion_record(m, "counterfactual"), m, "counterfactual")["status"] == completion.FAILED
+    return True
+
+@case("COMP9 counterfactual completion requires child digest")
+def t_comp9():
+    with tempfile.TemporaryDirectory() as td:
+        _f, _c, m, _fl, cl = _successful_wrapper_pair(td)
+        rows = lines_of(cl); next(x for x in rows if x.get("event") == sc.GENERATOR_STATE_RESTORED).pop("state_digest_child")
+        with open(cl, "w", encoding="utf-8", newline="\n") as fh: fh.write("\n".join(json.dumps(x) for x in rows) + "\n")
+        assert completion.make(_completion_record(m, "counterfactual"), m, "counterfactual")["status"] == completion.FAILED
+    return True
+
+@case("COMP10 counterfactual completion hashes child boundary state")
+def t_comp10():
+    with tempfile.TemporaryDirectory() as td:
+        _f, _c, m, _fl, _cl = _successful_wrapper_pair(td)
+        c = completion.load_verified(m["artifacts"]["counterfactual_completion"], m, "counterfactual")
+        assert c["child_state_digest"] == m["child_state_digest"]
+    return True
+
+@case("COMP11 successful counterfactual finalizes completion and child digest")
+def t_comp11():
+    with tempfile.TemporaryDirectory() as td:
+        _f, c, m, _fl, _cl = _successful_wrapper_pair(td)
+        assert c["completion_status"] == completion.COMPLETE and "counterfactual_completion" in m["artifacts"]
+    return True
+
+@case("COMP12 launch-strict validator independently verifies completions")
+def t_comp12():
+    with tempfile.TemporaryDirectory() as td:
+        _f, _c, m, fl, cl = _successful_wrapper_pair(td)
+        p = m["artifacts"]["counterfactual_completion"]["path"]; obj = json.load(open(p)); obj["status"] = completion.FAILED
+        with open(p, "w", encoding="utf-8", newline="\n") as fh: json.dump(obj, fh)
+        m["artifacts"]["counterfactual_completion"]["sha256"] = completion.sha256(p)
+        assert not sc.is_pass(sc.validate_pair(fl, cl, m))
+    return True
+
+@case("COMP13 launch-strict requires factual completion artifact")
+def t_comp13():
+    with tempfile.TemporaryDirectory() as td:
+        _f, _c, m, fl, cl = _successful_wrapper_pair(td); del m["artifacts"]["factual_completion"]
+        assert not sc.is_pass(sc.validate_pair(fl, cl, m))
+    return True
+
+@case("COMP14 launch-strict requires counterfactual completion artifact")
+def t_comp14():
+    with tempfile.TemporaryDirectory() as td:
+        _f, _c, m, fl, cl = _successful_wrapper_pair(td); del m["artifacts"]["counterfactual_completion"]
+        assert not sc.is_pass(sc.validate_pair(fl, cl, m))
+    return True
+
+@case("COMP15 launch-strict completion provenance is immutable")
+def t_comp15():
+    with tempfile.TemporaryDirectory() as td:
+        _f, _c, m, fl, cl = _successful_wrapper_pair(td)
+        p = m["artifacts"]["counterfactual_completion"]["path"]; obj = json.load(open(p)); obj["parent_state_digest"] = dict(obj["child_state_digest"])
+        with open(p, "w", encoding="utf-8", newline="\n") as fh: json.dump(obj, fh)
+        m["artifacts"]["counterfactual_completion"]["sha256"] = completion.sha256(p)
+        assert not sc.is_pass(sc.validate_pair(fl, cl, m))
+    return True
+
+@case("COMP16 counterfactual child digest must bind the manifest")
+def t_comp16():
+    with tempfile.TemporaryDirectory() as td:
+        _f, _c, m, fl, cl = _successful_wrapper_pair(td); m["child_state_digest"] = dict(m["parent_state_digest"])
+        assert not sc.is_pass(sc.validate_pair(fl, cl, m))
+    return True
 @case("COMP17 ledger target mismatch refuses")
 def t_comp17(): assert completion.engine_ledger_target("/x/f.jsonl","run-F")=="/x/f.run-F.jsonl" and completion.engine_ledger_target("/x/f","run-F")=="/x/f.run-F.jsonl"; return True
 @case("COMP18 stale completion path refuses")
@@ -2153,6 +2292,15 @@ def t_comp18():
         mp,p,q,args,env,target=_comp1_fixture(td); pre=os.path.join(td,"pre"); open(pre+".completion.json","w").write("old")
         r=gl.launch(mp,p,q,td,pre,["python","infer_single.py"],env=dict(env,EVOKE_STRICT_PAIR_ID="p",EVOKE_STRICT_RUN_ID="run-F",EVOKE_STRICT_BRANCH_ID="factual"),resolver=lambda *_:args,runner=lambda *_a,**_k:(_ for _ in ()).throw(AssertionError()))
         assert "COMPLETION_ARTIFACT_EXISTS" in r["reasons"]
+    return True
+
+@case("COMP19 sequential wrapper evidence reaches validator and countersign")
+def t_comp19():
+    with tempfile.TemporaryDirectory() as td:
+        _f, _c, m, fl, cl = _successful_wrapper_pair(td)
+        result = sc.validate_pair(fl, cl, m)
+        assert result["status"] == sc.STRICT_NOISE_COUPLED
+        assert sc.refuse_gpu_countersign(result) is False
     return True
 
 

@@ -201,6 +201,9 @@ def launch(pair_manifest_path, patch_path, profile_path, evoke_pin, artifact_pat
         if role == "factual":
             artifacts["factual_fork_capture"] = completion_record["fork_capture_sidecar"]
             manifest["parent_state_digest"] = completion_record["parent_state_digest"]
+        else:
+            artifacts["counterfactual_fork_capture"] = completion_record["factual_fork_capture"]
+            manifest["child_state_digest"] = completion_record["child_state_digest"]
         _bind_artifact(pair_manifest_path, manifest, role, artifact_path, artifact_sha, invocation_id, protocol_sha)
     return record
 
