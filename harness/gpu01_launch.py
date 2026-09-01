@@ -182,7 +182,11 @@ def launch(pair_manifest_path, patch_path, profile_path, evoke_pin, artifact_pat
         "EVOKE_GPU01_INVOCATION_ID": invocation_id,
         "EVOKE_GPU01_FORK_PROTOCOL_SHA256": protocol_sha,
     })
-    result = runner(list(child_argv), env=sealed_env, shell=False, check=False)
+    # Keep the archived/spawned argv byte-for-byte identical.  Relative EVOKE
+    # script paths are resolved by the child from its pinned checkout, not the
+    # CausalFork wrapper's cwd.
+    result = runner(list(child_argv), env=sealed_env, shell=False, check=False,
+                    cwd=evoke_pin)
     record["child_returncode"] = getattr(result, "returncode", result)
     record["prelaunch_artifact_path"] = os.path.abspath(artifact_path)
     record["prelaunch_artifact_sha256"] = artifact_sha

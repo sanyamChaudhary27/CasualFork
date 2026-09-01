@@ -2158,6 +2158,48 @@ def _run_comp(td, kind):
     finally: gl.sc1_preflight.preflight=old
     return r,mp,target
 
+
+@case("L13 relative child argv spawns from EVOKE cwd without archive rewrite")
+def t_l13():
+    with tempfile.TemporaryDirectory() as td:
+        mp, patch, profile, args, env, target = _comp1_fixture(td)
+        evoke = os.path.join(td, "evoke-pin"); os.mkdir(evoke)
+        old = gl.sc1_preflight.preflight; gl.sc1_preflight.preflight = lambda *_a, **_k: {"status":"PASS", "aborts":[]}
+        seen, child = {}, ["python", "scripts/inference/infer_single.py", "--seed", "7"]
+        def valid(manifest, pp, qq, pin, env, **kw):
+            return gp.validate_prelaunch(manifest, pp, qq, pin, env=env,
+                experiment_id="GPU-01", proposal_id="GPU-01", config_sha=env["EVOKE_STRICT_CONFIG_SHA256"],
+                pin_resolver=lambda _: gp.PIN, flash_probe=lambda:{"status":"PASS"}, fingerprint=lambda **x:{})
+        def runner(argv, env, **kw):
+            seen.update(argv=argv, cwd=kw.get("cwd"))
+            side, digest = os.path.join(td, "cap"), os.path.join(td, "parent")
+            open(side, "w").write("s"); open(digest, "w").write("d")
+            meta = {"event":"meta", "pair_id":"p", "run_id":"run-F", "branch_id":"factual",
+                    "gpu01_invocation_id":env["EVOKE_GPU01_INVOCATION_ID"],
+                    "prelaunch_artifact_sha256":env["EVOKE_GPU01_PRELAUNCH_ARTIFACT_SHA256"],
+                    "common_config_sha256":env["EVOKE_STRICT_CONFIG_SHA256"],
+                    "engine_resolved_config_sha256":env["EVOKE_STRICT_CONFIG_SHA256"],
+                    "engine_fork_protocol_sha256":env["EVOKE_GPU01_FORK_PROTOCOL_SHA256"]}
+            event = {"event":"FORK_CAPTURE", "chunk":1, "sidecar":side, "state_digest":digest}
+            with open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(meta) + "\n" + json.dumps(event) + "\n")
+            return 0
+        try:
+            record = gl.launch(mp, patch, profile, evoke, os.path.join(td, "pre"), child,
+                env=dict(env, EVOKE_STRICT_PAIR_ID="p", EVOKE_STRICT_RUN_ID="run-F", EVOKE_STRICT_BRANCH_ID="factual",
+                         EVOKE_STRICT_LEDGER_PATH=os.path.join(td, "factual.jsonl"),
+                         EVOKE_STRICT_FORK_JSON=json.dumps({"fork_chunk":1,"mode":"capture","out_dir":td})),
+                resolver=lambda *_: args, validator=valid, runner=runner)
+        finally:
+            gl.sc1_preflight.preflight = old
+        artifact = json.load(open(os.path.join(td, "pre"), encoding="utf-8"))
+        assert os.path.abspath(os.getcwd()) != os.path.abspath(evoke)
+        assert seen == {"argv": child, "cwd": evoke}
+        assert artifact["argv"] == child
+        assert artifact["argv_sha256"] == hashlib.sha256(json.dumps(child, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        assert record["completion_status"] == completion.COMPLETE
+    return True
+
 @case("COMP1 child nonzero completion failed")
 def t_comp1():
     with tempfile.TemporaryDirectory() as td: r,_,_= _run_comp(td,"nonzero"); assert r["completion_status"]==completion.FAILED
