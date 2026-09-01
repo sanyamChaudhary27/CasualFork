@@ -10,6 +10,8 @@ import subprocess
 import env_fingerprint
 import flash_attn_preflight
 import gpu01_config_identity as config_identity
+import gpu01_completion as completion
+import gpu01_fork_protocol as fork_protocol
 
 GPU01_PRELAUNCH_PASS = "GPU01_PRELAUNCH_PASS"
 ENV_BRINGUP_FAILURE = "ENV_BRINGUP_FAILURE"
@@ -65,7 +67,7 @@ def _identity_reasons(manifest, env, patch_path, profile_path, config_sha=None):
     return reasons
 
 
-def validate_role_freshness(manifest, current_role):
+def validate_role_freshness(manifest, current_role, fork_json=None):
     """Validate the frozen factual -> counterfactual wrapper lifecycle."""
     if current_role not in ("factual", "counterfactual"):
         return ["CURRENT_ROLE_UNKNOWN:%s" % current_role]
@@ -101,27 +103,27 @@ def validate_role_freshness(manifest, current_role):
             return ["SIBLING_NOT_UNSTARTED:%s" % sibling]
         return []
 
-    # Counterfactual requires an already completed factual sibling.
+    # Counterfactual requires immutable verified factual completion.
     spec = pre_spec("factual")
-    if not isinstance(sibling_log, str) or not os.path.exists(sibling_log):
-        return ["SIBLING_FACTUAL_LEDGER_MISSING"]
-    if not spec or not spec.get("path") or not spec.get("sha256"):
-        return ["SIBLING_FACTUAL_PRELAUNCH_MISSING"]
     try:
-        if file_sha256(spec["path"]) != spec["sha256"]:
-            return ["SIBLING_FACTUAL_PRELAUNCH_SHA_MISMATCH"]
-        with open(spec["path"], "r", encoding="utf-8") as fh:
-            archive = json.load(fh)
-    except Exception:
-        return ["SIBLING_FACTUAL_PRELAUNCH_UNREADABLE"]
+        factual_completion = completion.load_verified(artifacts.get("factual_completion"), manifest, "factual")
+    except Exception as exc:
+        return ["SIBLING_FACTUAL_COMPLETION_INVALID:%s" % type(exc).__name__]
     run_ids = manifest.get("run_ids") or {}
-    if archive.get("status") != GPU01_PRELAUNCH_PASS or archive.get("pair_id") != manifest.get("pair_id") or \
-            archive.get("run_id") != run_ids.get("factual") or archive.get("role") != "factual" or \
-            archive.get("invocation_id") != invocations.get("factual"):
-        return ["SIBLING_FACTUAL_PRELAUNCH_IDENTITY_MISMATCH"]
+    if factual_completion.get("invocation_id") != invocations.get("factual"):
+        return ["SIBLING_FACTUAL_COMPLETION_IDENTITY_MISMATCH"]
     declared_log_sha = log_spec("factual").get("sha256")
-    if declared_log_sha and file_sha256(sibling_log) != declared_log_sha:
+    if not declared_log_sha or declared_log_sha != factual_completion["ledger_sha256"] or file_sha256(sibling_log) != declared_log_sha:
         return ["SIBLING_FACTUAL_LEDGER_SHA_MISMATCH"]
+    try:
+        protocol = fork_protocol.canonical_gpu01_fork_protocol(
+            fork_json, "counterfactual")
+        operational = protocol["operational"]
+        if completion.normalized(operational["sidecar"]) != factual_completion["fork_capture_sidecar"]["path"] or \
+                completion.normalized(operational["parent_state_digest"]) != factual_completion["parent_state_digest"]["path"]:
+            return ["SIBLING_FACTUAL_RESTORE_INPUT_MISMATCH"]
+    except Exception:
+        return ["SIBLING_FACTUAL_RESTORE_INPUT_INVALID"]
     return []
 
 
@@ -165,7 +167,7 @@ def validate_prelaunch(manifest, patch_path, profile_path, evoke_pin_path,
             reasons.append("RUN_IDS_NOT_DISTINCT")
         else:
             role = env.get("EVOKE_STRICT_BRANCH_ID")
-            reasons.extend(validate_role_freshness(manifest, role))
+            reasons.extend(validate_role_freshness(manifest, role, env.get("EVOKE_STRICT_FORK_JSON")))
     if reasons:
         return {"status": GPU01_PRELAUNCH_REFUSED, "reasons": reasons}
 
